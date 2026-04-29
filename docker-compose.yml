@@ -1,0 +1,293 @@
+---
+# =============================================================================
+# Stack MLOps — Drift Monitoring
+# =============================================================================
+#
+# SERVICES :
+#   postgres          : base de données partagée (MLflow + tables applicatives)
+#   minio             : data lake objet (datasets, artefacts MLflow, snapshots)
+#   minio-init        : crée les buckets au démarrage (one-shot)
+#   mlflow            : tracking server + model registry
+#   airflow-init      : initialise la base Airflow + crée l'utilisateur admin
+#   airflow-webserver : interface web Airflow
+#   airflow-scheduler : exécute les DAGs
+#
+# DÉMARRAGE :
+#   docker-compose up -d
+#
+# ACCÈS :
+#   Airflow UI  : http://localhost:8080  (admin / admin)
+#   MLflow UI   : http://localhost:5000
+#   MinIO UI    : http://localhost:9001  (minioadmin / minioadmin)
+#   Postgres    : localhost:5432         (mlops / mlops)
+#
+# ARRÊT + NETTOYAGE :
+#   docker-compose down -v   (supprime aussi les volumes)
+#
+# PRÉREQUIS :
+#   - Docker Desktop >= 4.0
+#   - 4 GB RAM alloués à Docker (recommandé)
+#   - Ports libres : 5432, 5000, 8080, 9000, 9001
+# =============================================================================
+
+x-airflow-common:
+  # Bloc de configuration partagé par les deux services Airflow.
+  # x-airflow-common est une extension YAML (ancre) — pas un service Docker.
+  &airflow-common
+  image: apache/airflow:2.8.1-python3.11
+  environment:
+    &airflow-common-env
+    # Backend Airflow : Postgres (requis pour le scheduler CeleryExecutor ou LocalExecutor)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ""           # générer avec : python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"   # désactiver les exemples Airflow
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+
+    # Connexion à notre Postgres applicatif (différent du Postgres Airflow)
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: mlops
+    POSTGRES_USER: mlops
+    POSTGRES_PASSWORD: mlops
+
+    # MLflow
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+
+    # MinIO (utilisé par MLflow comme artifact store via S3 API)
+    MINIO_ENDPOINT: minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+
+    # Variables Airflow pour les DAGs (écrasées par Admin > Variables si besoin)
+    AIRFLOW_VAR_MLFLOW_TRACKING_URI: http://mlflow:5000
+    AIRFLOW_VAR_MODEL_NAME: drift_regressor
+    AIRFLOW_VAR_MIN_R2_FOR_REGISTRY: "0.70"
+    AIRFLOW_VAR_N_ROWS_TRAINING: "5000"
+    AIRFLOW_VAR_N_ROWS_MONITORING: "1000"
+    AIRFLOW_VAR_DRIFT_SIMULATION_FACTOR: "0.0"
+
+  volumes:
+    # Dossier des DAGs : modifiable à chaud sans redémarrer Airflow
+    - ./dags:/opt/airflow/dags
+    # Code source des modules Python (importés par les DAGs)
+    - ./src:/opt/airflow/project/src
+    # Logs Airflow persistés sur l'hôte pour inspection
+    - airflow-logs:/opt/airflow/logs
+    # Plugins Airflow (vide pour l'instant)
+    - ./plugins:/opt/airflow/plugins
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+
+services:
+
+  # ===========================================================================
+  # POSTGRES
+  # Joue deux rôles distincts via deux bases de données séparées :
+  #   - base "airflow"  : métadonnées internes d'Airflow (DAGs, runs, XComs)
+  #   - base "mlops"    : backend store MLflow + tables applicatives
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: mlops-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # Script d'init : crée les deux bases et leurs utilisateurs
+      POSTGRES_MULTIPLE_DATABASES: "airflow:airflow:airflow,mlops:mlops:mlops"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Script de création des bases multiples (voir ci-dessous)
+      - ./docker/postgres/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init.sh
+      # Tables applicatives (chargées après l'init Postgres)
+      - ./sql/app_tables.sql:/docker-entrypoint-initdb.d/app_tables.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MINIO
+  # Stockage objet compatible S3.
+  # Port 9000 : API S3 (utilisée par MLflow et notre code)
+  # Port 9001 : Console web (interface de gestion)
+  # ===========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: mlops-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"    # API S3
+      - "9001:9001"    # Console web
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MINIO INIT
+  # Conteneur one-shot qui crée les buckets au démarrage.
+  # S'arrête automatiquement après execution (restart: "no").
+  # Utilise le client mc (MinIO Client) inclus dans l'image.
+  # ===========================================================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: mlops-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/mlflow-artifacts;
+        mc mb --ignore-existing local/raw-datasets;
+        mc mb --ignore-existing local/processed-datasets;
+        mc mb --ignore-existing local/feature-stats;
+        mc mb --ignore-existing local/monitoring-snapshots;
+        echo 'Buckets créés.';
+      "
+    restart: "no"
+
+  # ===========================================================================
+  # MLFLOW
+  # Tracking server + Model Registry.
+  # --backend-store-uri  : Postgres pour les métadonnées (runs, params, metrics)
+  # --default-artifact-root : MinIO via S3 API pour les artefacts (modèles, fichiers)
+  # ===========================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: mlops-mlflow
+    command: >
+      mlflow server
+        --backend-store-uri postgresql://mlops:mlops@postgres/mlops
+        --default-artifact-root s3://mlflow-artifacts/
+        --host 0.0.0.0
+        --port 5000
+    environment:
+      # Configuration S3 pour accéder à MinIO
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ===========================================================================
+  # AIRFLOW INIT
+  # Conteneur one-shot qui :
+  #   1. Initialise la base de données Airflow (tables internes)
+  #   2. Crée l'utilisateur admin
+  # À relancer si on recrée les volumes Postgres.
+  # ===========================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: mlops-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db upgrade
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname MLOps \
+          --role Admin \
+          --email admin@mlops.local \
+          --password admin
+        echo "Airflow initialisé."
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: "true"
+    restart: "no"
+
+  # ===========================================================================
+  # AIRFLOW WEBSERVER
+  # Interface web Airflow.
+  # Accessible sur http://localhost:8080
+  # Identifiants : admin / admin
+  # ===========================================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: mlops-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # AIRFLOW SCHEDULER
+  # Exécute les DAGs selon leur schedule.
+  # Surveille les fichiers dans ./dags/ et recharge automatiquement
+  # les modifications (délai ~30s).
+  # ===========================================================================
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: mlops-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+
+# =============================================================================
+# VOLUMES
+# Tous les volumes sont nommés pour persistance entre les redémarrages.
+# Supprimer avec : docker-compose down -v
+# =============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  minio-data:
+    driver: local
+  airflow-logs:
+    driver: local
