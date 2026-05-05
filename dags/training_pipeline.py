@@ -61,7 +61,7 @@ with DAG(
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
-        from src.data_generation.generator import generate_reference_data
+        from src.data_generation.generator import generate_reference_data, generate_drifted_data, generate_partial_drift
         from src.storage.minio_client import (
             ensure_buckets_exist,
             make_dataset_object_name,

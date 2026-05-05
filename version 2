@@ -1,0 +1,5 @@
+1. generator.py    → optimisation perf (point 3) — déblocant pour tout le reste
+2. docker-compose  → ajouter ES + Kibana + MLflow décommenté
+3. es_client.py    → nouveau module d'indexation
+4. drift_metrics   → nouveaux tests (point 5)
+5. monitoring_pipeline → tâche ES + données driftées (points 1, 2, 4)
