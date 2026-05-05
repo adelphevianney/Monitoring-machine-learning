@@ -4,18 +4,19 @@ Client MinIO pour le système MLOps Drift Monitoring.
 RÔLE DE CE MODULE
 ─────────────────
 MinIO est notre "disque partagé" entre tous les composants.
-Il joue deux rôles distincts :
+Il stocke deux catégories d'objets :
 
-  Rôle 1 — Artifact store de MLflow
-    MLflow y stocke automatiquement les modèles sérialisés,
-    les courbes, les rapports. On ne touche pas à ça directement.
+  Artefacts de training
+    Modèles sérialisés, métriques, params, stats de référence,
+    feature importance. Organisés sous runs/<run_id>/.
+    Gérés par train.py, ce module fournit les helpers de nommage.
 
-  Rôle 2 — Data lake applicatif
-    Notre code y stocke les datasets et snapshots de monitoring.
-    C'est ce que gère CE module.
+  Data lake applicatif
+    Datasets bruts, datasets préprocessés, snapshots de monitoring.
 
 BUCKETS UTILISÉS
 ────────────────
+  models              : artefacts de training (modèle, métriques, stats)
   raw-datasets        : datasets bruts générés (parquet)
   processed-datasets  : datasets après preprocessing (parquet)
   feature-stats       : stats de référence au format JSON
@@ -23,22 +24,27 @@ BUCKETS UTILISÉS
 
 CONVENTIONS DE NOMMAGE DES OBJETS
 ──────────────────────────────────
+  models/runs/<run_id>/model.joblib
+  models/runs/<run_id>/metrics.json
+  models/runs/<run_id>/reference_stats/reference_stats.json
   raw-datasets/reference_v1_20240101T120000Z.parquet
   monitoring-snapshots/2024-01-15/window_14h_15h.parquet
 
-Toujours inclure un horodatage pour pouvoir rejouer les analyses.
+CLIENT UNIQUE : boto3
+─────────────────────
+On utilise UNIQUEMENT boto3 (compatible S3) pour éviter toute ambiguïté.
+Le SDK MinIO natif (minio.Minio) est abandonné.
 """
 
 import io
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
+import boto3
 import pandas as pd
-from minio import Minio
-from minio.error import S3Error
+from botocore.client import Config
 
 from src.config.settings import MINIO_CFG, MinIOConfig
 
@@ -47,19 +53,21 @@ logger = logging.getLogger(__name__)
 
 # ── Client singleton ──────────────────────────────────────────────────────────
 
-def get_client(cfg: MinIOConfig = MINIO_CFG) -> Minio:
+def get_minio_client(cfg: MinIOConfig = MINIO_CFG):
     """
-    Crée et retourne un client MinIO.
+    Crée et retourne un client boto3 pointant vers MinIO.
 
     On recrée le client à chaque appel pour éviter les problèmes
     de connexions mortes dans les DAGs Airflow longue durée.
-    Le client MinIO est léger, il n'y a pas de pool à gérer.
+    boto3 est léger : pas de pool à gérer.
     """
-    return Minio(
-        endpoint=cfg.endpoint,
-        access_key=cfg.access_key,
-        secret_key=cfg.secret_key,
-        secure=cfg.secure,
+    return boto3.client(
+        "s3",
+        endpoint_url=cfg.endpoint_url,
+        aws_access_key_id=cfg.access_key,
+        aws_secret_access_key=cfg.secret_key,
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
     )
 
 
@@ -70,10 +78,11 @@ def ensure_buckets_exist(cfg: MinIOConfig = MINIO_CFG) -> None:
     À appeler au démarrage de l'infrastructure (docker-compose entrypoint
     ou premier run Airflow). Idempotent : safe à appeler plusieurs fois.
     """
-    client = get_client(cfg)
+    client = get_minio_client(cfg)
+    existing = {b["Name"] for b in client.list_buckets().get("Buckets", [])}
     for bucket in cfg.buckets:
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
+        if bucket not in existing:
+            client.create_bucket(Bucket=bucket)
             logger.info("Bucket créé : %s", bucket)
         else:
             logger.debug("Bucket existant : %s", bucket)
@@ -82,9 +91,9 @@ def ensure_buckets_exist(cfg: MinIOConfig = MINIO_CFG) -> None:
 def check_connection(cfg: MinIOConfig = MINIO_CFG) -> bool:
     """Vérifie que MinIO est accessible. Utile au démarrage des DAGs."""
     try:
-        client = get_client(cfg)
+        client = get_minio_client(cfg)
         client.list_buckets()
-        logger.info("Connexion MinIO OK (%s)", cfg.endpoint)
+        logger.info("Connexion MinIO OK (%s)", cfg.endpoint_url)
         return True
     except Exception as exc:
         logger.error("MinIO inaccessible : %s", exc)
@@ -107,28 +116,21 @@ def upload_dataframe(
     - Compressé : ~10x plus léger que CSV sur des données numériques
     - Typé : préserve les types pandas (float64, bool, etc.)
 
-    Args:
-        df          : DataFrame à uploader
-        bucket      : nom du bucket cible (ex: 'raw-datasets')
-        object_name : chemin de l'objet dans le bucket
-                      (ex: 'reference_v1_20240101T120000Z.parquet')
-
     Returns:
         URI complète de l'objet : "s3://bucket/object_name"
     """
-    # Sérialiser le DataFrame en mémoire (pas de fichier temporaire)
     buffer = io.BytesIO()
     df.to_parquet(buffer, index=False, engine="pyarrow")
     buffer.seek(0)
     size = buffer.getbuffer().nbytes
 
-    client = get_client(cfg)
+    client = get_minio_client(cfg)
     client.put_object(
-        bucket_name=bucket,
-        object_name=object_name,
-        data=buffer,
-        length=size,
-        content_type="application/octet-stream",
+        Bucket=bucket,
+        Key=object_name,
+        Body=buffer,
+        ContentLength=size,
+        ContentType="application/octet-stream",
     )
 
     uri = f"s3://{bucket}/{object_name}"
@@ -143,24 +145,11 @@ def download_dataframe(
 ) -> pd.DataFrame:
     """
     Télécharge un objet parquet depuis MinIO et le retourne comme DataFrame.
-
-    Args:
-        bucket      : nom du bucket source
-        object_name : chemin de l'objet dans le bucket
-
-    Returns:
-        DataFrame pandas
     """
-    client = get_client(cfg)
-    response = client.get_object(bucket_name=bucket, object_name=object_name)
-
-    try:
-        buffer = io.BytesIO(response.read())
-        df = pd.read_parquet(buffer, engine="pyarrow")
-    finally:
-        response.close()
-        response.release_conn()
-
+    client = get_minio_client(cfg)
+    response = client.get_object(Bucket=bucket, Key=object_name)
+    buffer = io.BytesIO(response["Body"].read())
+    df = pd.read_parquet(buffer, engine="pyarrow")
     logger.info(
         "Download réussi : s3://%s/%s (%d lignes)", bucket, object_name, len(df)
     )
@@ -174,7 +163,6 @@ def download_dataframe_from_uri(uri: str, cfg: MinIOConfig = MINIO_CFG) -> pd.Da
     Pratique quand on stocke l'URI dans Postgres et qu'on veut
     recharger le dataset directement depuis l'URI stockée.
     """
-    # Parser l'URI : "s3://raw-datasets/reference_v1.parquet"
     if not uri.startswith("s3://"):
         raise ValueError(f"URI invalide, doit commencer par 's3://' : {uri}")
 
@@ -197,22 +185,19 @@ def upload_json(
     """
     Upload un dict Python comme JSON vers MinIO.
 
-    Utilisé pour sauvegarder les stats de référence (feature_stats)
-    et les résultats de monitoring au format lisible.
-
     Returns:
         URI "s3://bucket/object_name"
     """
     payload = json.dumps(data, indent=2, default=str).encode("utf-8")
     buffer = io.BytesIO(payload)
 
-    client = get_client(cfg)
+    client = get_minio_client(cfg)
     client.put_object(
-        bucket_name=bucket,
-        object_name=object_name,
-        data=buffer,
-        length=len(payload),
-        content_type="application/json",
+        Bucket=bucket,
+        Key=object_name,
+        Body=buffer,
+        ContentLength=len(payload),
+        ContentType="application/json",
     )
 
     uri = f"s3://{bucket}/{object_name}"
@@ -226,14 +211,49 @@ def download_json(
     cfg: MinIOConfig = MINIO_CFG,
 ) -> dict:
     """Télécharge un objet JSON depuis MinIO et retourne un dict Python."""
-    client = get_client(cfg)
-    response = client.get_object(bucket_name=bucket, object_name=object_name)
-    try:
-        data = json.loads(response.read().decode("utf-8"))
-    finally:
-        response.close()
-        response.release_conn()
+    client = get_minio_client(cfg)
+    response = client.get_object(Bucket=bucket, Key=object_name)
+    data = json.loads(response["Body"].read().decode("utf-8"))
     return data
+
+
+def upload_bytes(
+    data: bytes,
+    bucket: str,
+    object_name: str,
+    content_type: str = "application/octet-stream",
+    cfg: MinIOConfig = MINIO_CFG,
+) -> str:
+    """
+    Upload des bytes bruts vers MinIO.
+
+    Utilisé pour les modèles joblib, CSV, et autres binaires.
+
+    Returns:
+        URI "s3://bucket/object_name"
+    """
+    client = get_minio_client(cfg)
+    client.put_object(
+        Bucket=bucket,
+        Key=object_name,
+        Body=io.BytesIO(data),
+        ContentLength=len(data),
+        ContentType=content_type,
+    )
+    uri = f"s3://{bucket}/{object_name}"
+    logger.debug("Bytes uploadés → %s (%.1f KB)", uri, len(data) / 1024)
+    return uri
+
+
+def download_bytes(
+    bucket: str,
+    object_name: str,
+    cfg: MinIOConfig = MINIO_CFG,
+) -> bytes:
+    """Télécharge un objet binaire depuis MinIO."""
+    client = get_minio_client(cfg)
+    response = client.get_object(Bucket=bucket, Key=object_name)
+    return response["Body"].read()
 
 
 # ── Helpers de nommage ────────────────────────────────────────────────────────
@@ -255,8 +275,6 @@ def make_snapshot_object_name(window_start: datetime, window_end: datetime) -> s
     Génère un nom d'objet pour un snapshot de monitoring.
 
     Ex : "2024-01-15/window_14h00_15h00.parquet"
-
-    On organise par date pour faciliter le parcours chronologique.
     """
     date_prefix = window_start.strftime("%Y-%m-%d")
     start_str = window_start.strftime("%Hh%M")
@@ -264,15 +282,24 @@ def make_snapshot_object_name(window_start: datetime, window_end: datetime) -> s
     return f"{date_prefix}/window_{start_str}_{end_str}.parquet"
 
 
-def make_stats_object_name(mlflow_run_id: str) -> str:
+def make_stats_object_name(run_id: str) -> str:
     """
     Génère un nom d'objet pour un fichier de stats de référence.
 
     Ex : "stats_a1b2c3d4_20240101T120000Z.json"
     """
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    short_id = mlflow_run_id[:8]
+    short_id = run_id[:8]
     return f"stats_{short_id}_{ts}.json"
+
+
+def make_run_prefix(run_id: str) -> str:
+    """
+    Retourne le préfixe MinIO d'un run de training.
+
+    Ex : make_run_prefix("a1b2c3d4e5f6") → "runs/a1b2c3d4e5f6"
+    """
+    return f"runs/{run_id}"
 
 
 # ── Utilitaires ───────────────────────────────────────────────────────────────
@@ -285,22 +312,21 @@ def list_objects(
     """
     Liste les objets dans un bucket (avec préfixe optionnel).
 
-    Utile pour inspecter le contenu du data lake ou trouver
-    le dataset le plus récent d'un préfixe donné.
-
     Returns:
         Liste de dicts : {"name": ..., "size": ..., "last_modified": ...}
     """
-    client = get_client(cfg)
-    objects = client.list_objects(bucket, prefix=prefix, recursive=True)
+    client = get_minio_client(cfg)
+    paginator = client.get_paginator("list_objects_v2")
+    pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
 
     result = []
-    for obj in objects:
-        result.append({
-            "name": obj.object_name,
-            "size": obj.size,
-            "last_modified": obj.last_modified,
-        })
+    for page in pages:
+        for obj in page.get("Contents", []):
+            result.append({
+                "name": obj["Key"],
+                "size": obj["Size"],
+                "last_modified": obj["LastModified"],
+            })
 
     logger.debug("Liste bucket '%s' prefix='%s' : %d objets", bucket, prefix, len(result))
     return result
@@ -313,9 +339,6 @@ def get_latest_object(
 ) -> Optional[str]:
     """
     Retourne le nom du dernier objet uploadé dans un bucket (par date).
-
-    Pratique pour charger le dataset de référence le plus récent
-    sans avoir à stocker le nom explicitement.
 
     Returns:
         Nom de l'objet le plus récent, ou None si le bucket est vide.

@@ -6,19 +6,30 @@ Responsabilités :
   2. Split train / validation
   3. Entraîner un RandomForestRegressor (ou autre modèle via config)
   4. Évaluer sur le jeu de validation
-  5. Logger le run dans MLflow (params + métriques + artefacts)
+  5. Sauvegarder le modèle, les métriques et les artefacts dans MinIO
   6. Calculer et sauvegarder les stats de référence
-  7. Enregistrer le modèle dans le MLflow Model Registry
+
+STOCKAGE
+────────
+Tous les uploads passent par src.storage.minio_client (boto3 uniquement).
+Ce module n'instancie plus de client directement.
+
+Structure des artefacts dans MinIO (bucket=MINIO_CFG.bucket) :
+    runs/<run_id>/model.joblib
+    runs/<run_id>/metrics.json
+    runs/<run_id>/params.json
+    runs/<run_id>/tags.json
+    runs/<run_id>/reference_stats/reference_stats.json
+    runs/<run_id>/reports/feature_importance.csv
 """
 
+import io
 import json
 import logging
 import time
-from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-import mlflow
-import mlflow.sklearn
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -26,12 +37,18 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
-from src.config.settings import MLFLOW_CFG, TRAIN_CFG, TrainingConfig
+from src.config.settings import MINIO_CFG, TRAIN_CFG, TrainingConfig
 from src.data_generation.generator import compute_feature_stats
+from src.storage.minio_client import (
+    ensure_buckets_exist,
+    upload_bytes,
+    upload_json,
+    make_run_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── modèles disponibles ───────────────────────────────────────────────────────
+# ── Modèles disponibles ───────────────────────────────────────────────────────
 MODEL_REGISTRY = {
     "random_forest": RandomForestRegressor,
     "gradient_boosting": GradientBoostingRegressor,
@@ -39,7 +56,7 @@ MODEL_REGISTRY = {
 }
 
 
-# ── évaluation ────────────────────────────────────────────────────────────────
+# ── Évaluation ────────────────────────────────────────────────────────────────
 
 def evaluate_model(
     model,
@@ -47,7 +64,7 @@ def evaluate_model(
     y: pd.Series,
 ) -> Dict[str, float]:
     """
-    Calcule les métriques de régression.
+    Calcule les métriques de régression sur un jeu de données.
 
     Returns:
         dict avec rmse, mae, r2, mse
@@ -62,7 +79,7 @@ def evaluate_model(
     }
 
 
-# ── entraînement ──────────────────────────────────────────────────────────────
+# ── Entraînement ──────────────────────────────────────────────────────────────
 
 def train(
     df: pd.DataFrame,
@@ -71,14 +88,14 @@ def train(
     features: Optional[list] = None,
     target: str = "y",
     cfg: TrainingConfig = TRAIN_CFG,
-) -> Tuple[object, Dict[str, float], pd.DataFrame, pd.DataFrame]:
+) -> Tuple[object, Dict[str, float], pd.DataFrame, pd.Series]:
     """
     Entraîne un modèle de régression.
 
     Args:
         df          : DataFrame d'entraînement
         model_type  : clé dans MODEL_REGISTRY
-        model_params: hyperparamètres du modèle
+        model_params: hyperparamètres du modèle (None = valeurs par défaut)
         features    : liste des colonnes features (défaut : tout sauf target)
         target      : nom de la colonne cible
         cfg         : config d'entraînement
@@ -87,7 +104,9 @@ def train(
         (model, metrics, X_val, y_val)
     """
     if model_type not in MODEL_REGISTRY:
-        raise ValueError(f"model_type '{model_type}' inconnu. Disponibles : {list(MODEL_REGISTRY)}")
+        raise ValueError(
+            f"model_type '{model_type}' inconnu. Disponibles : {list(MODEL_REGISTRY)}"
+        )
 
     cols_features = features or [c for c in df.columns if c != target]
     X = df[cols_features]
@@ -151,7 +170,7 @@ def _default_params(model_type: str, seed: int) -> Dict:
     return defaults.get(model_type, {})
 
 
-# ── pipeline MLflow ───────────────────────────────────────────────────────────
+# ── Pipeline complet ──────────────────────────────────────────────────────────
 
 def run_training_pipeline(
     df: pd.DataFrame,
@@ -159,109 +178,107 @@ def run_training_pipeline(
     dataset_uri: str = "",
     model_type: str = "random_forest",
     model_params: Optional[Dict] = None,
-    register_model: bool = True,
-    transition_to_staging: bool = False,
 ) -> str:
     """
-    Pipeline complet : entraîne + logue dans MLflow + enregistre le modèle.
+    Pipeline complet : entraîne + sauvegarde tous les artefacts dans MinIO.
+
+    Tous les uploads passent par minio_client.upload_bytes / upload_json.
+    Aucun client boto3 n'est instancié ici directement.
+
+    Structure dans le bucket MINIO_CFG.bucket :
+        runs/<run_id>/model.joblib
+        runs/<run_id>/metrics.json
+        runs/<run_id>/params.json
+        runs/<run_id>/tags.json
+        runs/<run_id>/reference_stats/reference_stats.json
+        runs/<run_id>/reports/feature_importance.csv     (si disponible)
 
     Args:
-        df                   : DataFrame d'entraînement
-        dataset_version      : identifiant lisible du dataset
-        dataset_uri          : URI MinIO ou chemin local du dataset
-        model_type           : type de modèle à entraîner
-        model_params         : hyperparamètres (None = défauts)
-        register_model       : enregistrer dans le Model Registry MLflow
-        transition_to_staging: promouvoir automatiquement en Staging
+        df              : DataFrame d'entraînement
+        dataset_version : identifiant lisible du dataset (ex: "v20240101")
+        dataset_uri     : URI MinIO ou chemin local du dataset
+        model_type      : type de modèle à entraîner
+        model_params    : hyperparamètres (None = valeurs par défaut)
 
     Returns:
-        mlflow_run_id (str)
+        run_id (str) — préfixe MinIO utilisé pour ce run
     """
-    mlflow.set_tracking_uri(MLFLOW_CFG.tracking_uri)
-    mlflow.set_experiment(MLFLOW_CFG.experiment_name)
+    import uuid
+    run_id = uuid.uuid4().hex[:12]
+    prefix = make_run_prefix(run_id)
+    bucket = MINIO_CFG.bucket
+
+    ensure_buckets_exist()
+    logger.info("Démarrage du run : %s  (bucket=%s)", run_id, bucket)
 
     features = [c for c in df.columns if c != "y"]
 
-    with mlflow.start_run() as run:
-        run_id = run.info.run_id
-        logger.info("MLflow run démarré : %s", run_id)
+    # ── tags ──────────────────────────────────────────────────────────────────
+    tags = {
+        "model_type": model_type,
+        "dataset_version": dataset_version,
+        "dataset_uri": dataset_uri,
+        "features": features,
+    }
+    upload_json(tags, bucket, f"{prefix}/tags.json")
 
-        # ── tags ──
-        mlflow.set_tags({
-            "model_type": model_type,
-            "dataset_version": dataset_version,
-            "dataset_uri": dataset_uri,
-            "features": json.dumps(features),
-        })
+    # ── params ────────────────────────────────────────────────────────────────
+    params = model_params or _default_params(model_type, TRAIN_CFG.random_seed)
+    upload_json(params, bucket, f"{prefix}/params.json")
 
-        # ── entraînement ──
-        params = model_params or _default_params(model_type, TRAIN_CFG.random_seed)
-        mlflow.log_params(params)
+    # ── entraînement ──────────────────────────────────────────────────────────
+    model, metrics, X_val, y_val = train(
+        df, model_type=model_type, model_params=params
+    )
 
-        model, metrics, X_val, y_val = train(
-            df, model_type=model_type, model_params=params
+    # ── métriques ─────────────────────────────────────────────────────────────
+    upload_json(metrics, bucket, f"{prefix}/metrics.json")
+    logger.info(
+        "Métriques sauvegardées — val_r2=%.4f val_rmse=%.4f",
+        metrics.get("val_r2", 0), metrics.get("val_rmse", 0),
+    )
+
+    # ── stats de référence ────────────────────────────────────────────────────
+    ref_stats = compute_feature_stats(df, features)
+    ref_stats_dict = ref_stats.round(6).to_dict(orient="index")
+    upload_json(
+        ref_stats_dict,
+        bucket,
+        f"{prefix}/reference_stats/reference_stats.json",
+    )
+    logger.info("Stats de référence sauvegardées (%d features)", len(features))
+
+    # ── feature importance (si disponible) ────────────────────────────────────
+    if hasattr(model, "feature_importances_"):
+        importance = pd.DataFrame({
+            "feature": features,
+            "importance": model.feature_importances_,
+        }).sort_values("importance", ascending=False)
+        upload_bytes(
+            importance.to_csv(index=False).encode(),
+            bucket,
+            f"{prefix}/reports/feature_importance.csv",
+            content_type="text/csv",
         )
-        mlflow.log_metrics(metrics)
+        logger.info("Feature importance sauvegardée")
 
-        # ── stats de référence (artefact JSON) ──
-        ref_stats = compute_feature_stats(df, features)
-        stats_path = Path("/tmp") / f"reference_stats_{run_id[:8]}.json"
-        ref_stats_dict = ref_stats.round(6).to_dict(orient="index")
-        stats_path.write_text(json.dumps(ref_stats_dict, indent=2))
-        mlflow.log_artifact(str(stats_path), artifact_path="reference_stats")
-        logger.info("Stats de référence loguées (%d features)", len(features))
+    # ── modèle (joblib) ───────────────────────────────────────────────────────
+    model_buffer = io.BytesIO()
+    joblib.dump(model, model_buffer)
+    model_buffer.seek(0)
+    upload_bytes(
+        model_buffer.read(),
+        bucket,
+        f"{prefix}/model.joblib",
+        content_type="application/octet-stream",
+    )
+    logger.info("Modèle sauvegardé → s3://%s/%s/model.joblib", bucket, prefix)
 
-        # ── feature importance (si disponible) ──
-        if hasattr(model, "feature_importances_"):
-            importance = pd.DataFrame({
-                "feature": features,
-                "importance": model.feature_importances_,
-            }).sort_values("importance", ascending=False)
-            imp_path = Path("/tmp") / f"feature_importance_{run_id[:8]}.csv"
-            importance.to_csv(imp_path, index=False)
-            mlflow.log_artifact(str(imp_path), artifact_path="reports")
-
-        # ── log du modèle ──
-        model_signature = mlflow.models.infer_signature(
-            pd.DataFrame(X_val), model.predict(X_val)
-        )
-        mlflow.sklearn.log_model(
-            model,
-            artifact_path="model",
-            signature=model_signature,
-            registered_model_name=TRAIN_CFG.model_name if register_model else None,
-        )
-
-        logger.info("Run MLflow terminé : %s", run_id)
-
-        # ── transition automatique vers Staging ──
-        if register_model and transition_to_staging:
-            _promote_to_staging(TRAIN_CFG.model_name)
-
+    logger.info("Run terminé : %s", run_id)
     return run_id
 
 
-def _promote_to_staging(model_name: str) -> None:
-    """Promeut la dernière version du modèle en Staging."""
-    from mlflow.tracking import MlflowClient
-
-    client = MlflowClient(tracking_uri=MLFLOW_CFG.tracking_uri)
-    versions = client.search_model_versions(f"name='{model_name}'")
-    if not versions:
-        logger.warning("Aucune version trouvée pour '%s'", model_name)
-        return
-
-    latest = max(versions, key=lambda v: int(v.version))
-    client.transition_model_version_stage(
-        name=model_name,
-        version=latest.version,
-        stage="Staging",
-        archive_existing_versions=False,
-    )
-    logger.info("Modèle '%s' v%s → Staging", model_name, latest.version)
-
-
-# ── point d'entrée CLI ────────────────────────────────────────────────────────
+# ── Point d'entrée CLI ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
@@ -278,9 +295,5 @@ if __name__ == "__main__":
         df = generate_reference_data()
         version = "reference_v1"
 
-    run_id = run_training_pipeline(
-        df,
-        dataset_version=version,
-        register_model=False,   # False pour test local sans registry
-    )
+    run_id = run_training_pipeline(df, dataset_version=version)
     print(f"\nRun ID : {run_id}")

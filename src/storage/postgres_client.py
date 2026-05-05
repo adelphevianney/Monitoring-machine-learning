@@ -60,7 +60,6 @@ def get_connection(cfg: PostgresConfig = PG_CFG):
             dbname=cfg.database,
             user=cfg.user,
             password=cfg.password,
-            # Retourne les lignes comme des dicts plutôt que des tuples
             cursor_factory=RealDictCursor,
         )
         yield conn
@@ -91,58 +90,60 @@ def check_connection(cfg: PostgresConfig = PG_CFG) -> bool:
 # ── TABLE : training_runs ─────────────────────────────────────────────────────
 
 def insert_training_run(
-    mlflow_run_id: str,
+    run_id: str,
     model_name: str,
     dataset_uri: str,
     n_rows: int,
     val_rmse: Optional[float] = None,
     val_r2: Optional[float] = None,
-    model_version: Optional[int] = None,
+    train_duration_sec: Optional[float] = None,
+    dataset_version: Optional[str] = None,
     status: str = "running",
 ) -> str:
     """
     Crée un enregistrement pour un nouveau run d'entraînement.
 
     Appelé au DÉBUT du pipeline d'entraînement (status='running'),
-    puis mis à jour à la fin (status='success' ou 'failed').
+    puis mis à jour à la fin via update_training_run_status().
+
+    Args:
+        run_id : identifiant du run, correspond au préfixe MinIO runs/<run_id>/
 
     Returns:
-        run_id (UUID interne, différent du mlflow_run_id)
+        run_id
     """
-    run_id = str(uuid.uuid4())
-
     sql = """
         INSERT INTO training_runs
-            (run_id, mlflow_run_id, model_name, model_version,
-             dataset_uri, status, n_rows, val_rmse, val_r2)
+            (run_id, model_name, dataset_uri, dataset_version,
+             status, n_rows, val_rmse, val_r2, train_duration_sec)
         VALUES
-            (%(run_id)s, %(mlflow_run_id)s, %(model_name)s, %(model_version)s,
-             %(dataset_uri)s, %(status)s, %(n_rows)s, %(val_rmse)s, %(val_r2)s)
+            (%(run_id)s, %(model_name)s, %(dataset_uri)s, %(dataset_version)s,
+             %(status)s, %(n_rows)s, %(val_rmse)s, %(val_r2)s, %(train_duration_sec)s)
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, {
                 "run_id": run_id,
-                "mlflow_run_id": mlflow_run_id,
                 "model_name": model_name,
-                "model_version": model_version,
                 "dataset_uri": dataset_uri,
+                "dataset_version": dataset_version,
                 "status": status,
                 "n_rows": n_rows,
                 "val_rmse": val_rmse,
                 "val_r2": val_r2,
+                "train_duration_sec": train_duration_sec,
             })
 
-    logger.info("training_run créé : run_id=%s mlflow=%s", run_id[:8], mlflow_run_id[:8])
+    logger.info("training_run créé : run_id=%s", run_id[:8])
     return run_id
 
 
 def update_training_run_status(
-    mlflow_run_id: str,
+    run_id: str,
     status: str,
-    model_version: Optional[int] = None,
     val_rmse: Optional[float] = None,
     val_r2: Optional[float] = None,
+    train_duration_sec: Optional[float] = None,
 ) -> None:
     """
     Met à jour le statut d'un run après entraînement.
@@ -152,43 +153,43 @@ def update_training_run_status(
     sql = """
         UPDATE training_runs
         SET
-            status        = %(status)s,
-            model_version = COALESCE(%(model_version)s, model_version),
-            val_rmse      = COALESCE(%(val_rmse)s, val_rmse),
-            val_r2        = COALESCE(%(val_r2)s, val_r2)
-        WHERE mlflow_run_id = %(mlflow_run_id)s
+            status             = %(status)s,
+            val_rmse           = COALESCE(%(val_rmse)s, val_rmse),
+            val_r2             = COALESCE(%(val_r2)s, val_r2),
+            train_duration_sec = COALESCE(%(train_duration_sec)s, train_duration_sec),
+            updated_at         = NOW()
+        WHERE run_id = %(run_id)s
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, {
+                "run_id": run_id,
                 "status": status,
-                "model_version": model_version,
                 "val_rmse": val_rmse,
                 "val_r2": val_r2,
-                "mlflow_run_id": mlflow_run_id,
+                "train_duration_sec": train_duration_sec,
             })
-    logger.info("training_run mis à jour : mlflow=%s → status=%s", mlflow_run_id[:8], status)
+    logger.info("training_run mis à jour : run_id=%s → status=%s", run_id[:8], status)
 
 
-def get_production_model_info(model_name: str) -> Optional[Dict]:
+def get_latest_successful_run(model_name: str) -> Optional[Dict]:
     """
-    Récupère les infos du modèle actuellement en production.
+    Récupère le run le plus récent avec status='success'.
 
-    Retourne le run le plus récent avec status='success' et une version enregistrée.
     Le monitoring a besoin de ces infos pour savoir quelle référence utiliser.
+    Les artefacts sont accessibles dans MinIO sous runs/<run_id>/.
 
     Returns:
-        Dict avec run_id, mlflow_run_id, model_version, val_rmse, val_r2
-        ou None si aucun modèle en production.
+        Dict avec run_id, model_name, run_date, dataset_uri, n_rows, val_rmse, val_r2
+        ou None si aucun run réussi.
     """
     sql = """
-        SELECT run_id, mlflow_run_id, model_name, model_version,
-               run_date, dataset_uri, n_rows, val_rmse, val_r2
+        SELECT run_id, model_name, run_date, dataset_uri,
+               dataset_version, n_rows, val_rmse, val_r2, train_duration_sec
         FROM training_runs
         WHERE model_name = %(model_name)s
           AND status = 'success'
-          AND model_version IS NOT NULL
-        ORDER BY model_version DESC, run_date DESC
+        ORDER BY run_date DESC
         LIMIT 1
     """
     with get_connection() as conn:
@@ -199,19 +200,19 @@ def get_production_model_info(model_name: str) -> Optional[Dict]:
     if row:
         result = dict(row)
         logger.info(
-            "Modèle en production : %s v%s (mlflow=%s)",
-            model_name, result["model_version"], result["mlflow_run_id"][:8]
+            "Dernier run réussi : %s → run_id=%s",
+            model_name, result["run_id"][:8],
         )
         return result
 
-    logger.warning("Aucun modèle en production trouvé pour '%s'", model_name)
+    logger.warning("Aucun run réussi trouvé pour '%s'", model_name)
     return None
 
 
 # ── TABLE : reference_feature_stats ──────────────────────────────────────────
 
 def insert_reference_stats(
-    mlflow_run_id: str,
+    run_id: str,
     stats_df,  # pandas DataFrame issu de compute_feature_stats()
 ) -> int:
     """
@@ -225,12 +226,12 @@ def insert_reference_stats(
     """
     sql = """
         INSERT INTO reference_feature_stats
-            (mlflow_run_id, feature_name, mean_value, std_value,
-             min_value, max_value, q25, median, q75, n_obs)
+            (run_id, feature_name, mean_value, std_value,
+             min_value, max_value, q25, median, q75, n_rows)
         VALUES
-            (%(mlflow_run_id)s, %(feature_name)s, %(mean_value)s, %(std_value)s,
-             %(min_value)s, %(max_value)s, %(q25)s, %(median)s, %(q75)s, %(n_obs)s)
-        ON CONFLICT (mlflow_run_id, feature_name) DO UPDATE SET
+            (%(run_id)s, %(feature_name)s, %(mean_value)s, %(std_value)s,
+             %(min_value)s, %(max_value)s, %(q25)s, %(median)s, %(q75)s, %(n_rows)s)
+        ON CONFLICT (run_id, feature_name) DO UPDATE SET
             mean_value = EXCLUDED.mean_value,
             std_value  = EXCLUDED.std_value,
             min_value  = EXCLUDED.min_value,
@@ -242,7 +243,7 @@ def insert_reference_stats(
     rows = []
     for feature_name, row in stats_df.iterrows():
         rows.append({
-            "mlflow_run_id": mlflow_run_id,
+            "run_id": run_id,
             "feature_name": feature_name,
             "mean_value": float(row["mean"]),
             "std_value": float(row["std"]),
@@ -251,7 +252,7 @@ def insert_reference_stats(
             "q25": float(row["q25"]),
             "median": float(row["median"]),
             "q75": float(row["q75"]),
-            "n_obs": int(row.get("count", 0)) if "count" in row else None,
+            "n_rows": int(row.get("count", 0)) if "count" in row else None,
         })
 
     with get_connection() as conn:
@@ -259,13 +260,13 @@ def insert_reference_stats(
             psycopg2.extras.execute_batch(cur, sql, rows)
 
     logger.info(
-        "Stats de référence insérées : %d features pour mlflow_run=%s",
-        len(rows), mlflow_run_id[:8]
+        "Stats de référence insérées : %d features pour run_id=%s",
+        len(rows), run_id[:8],
     )
     return len(rows)
 
 
-def get_reference_stats(mlflow_run_id: str) -> Dict[str, Dict]:
+def get_reference_stats(run_id: str) -> Dict[str, Dict]:
     """
     Charge les stats de référence associées à un run d'entraînement.
 
@@ -275,24 +276,24 @@ def get_reference_stats(mlflow_run_id: str) -> Dict[str, Dict]:
     """
     sql = """
         SELECT feature_name, mean_value, std_value, min_value,
-               max_value, q25, median, q75, n_obs
+               max_value, q25, median, q75, n_rows
         FROM reference_feature_stats
-        WHERE mlflow_run_id = %(mlflow_run_id)s
+        WHERE run_id = %(run_id)s
         ORDER BY feature_name
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, {"mlflow_run_id": mlflow_run_id})
+            cur.execute(sql, {"run_id": run_id})
             rows = cur.fetchall()
 
     if not rows:
-        logger.warning("Aucune stat de référence pour mlflow_run=%s", mlflow_run_id[:8])
+        logger.warning("Aucune stat de référence pour run_id=%s", run_id[:8])
         return {}
 
     result = {row["feature_name"]: dict(row) for row in rows}
     logger.info(
-        "Stats de référence chargées : %d features pour mlflow_run=%s",
-        len(result), mlflow_run_id[:8]
+        "Stats de référence chargées : %d features pour run_id=%s",
+        len(result), run_id[:8],
     )
     return result
 
@@ -300,7 +301,7 @@ def get_reference_stats(mlflow_run_id: str) -> Dict[str, Dict]:
 # ── TABLE : drift_monitoring_runs ─────────────────────────────────────────────
 
 def insert_monitoring_run(
-    model_version: int,
+    ref_run_id: str,
     observation_start: datetime,
     observation_end: datetime,
     drift_score_global: float,
@@ -315,7 +316,9 @@ def insert_monitoring_run(
     Appelé UNE FOIS par exécution du DAG drift_monitoring,
     après avoir calculé tous les scores.
 
-    alert_level : 'none' | 'warning' | 'critical'
+    Args:
+        ref_run_id : run_id du training run utilisé comme référence
+        alert_level: 'none' | 'warning' | 'critical'
 
     Returns:
         monitoring_run_id (UUID)
@@ -324,31 +327,31 @@ def insert_monitoring_run(
 
     sql = """
         INSERT INTO drift_monitoring_runs
-            (monitoring_run_id, model_version, observation_start, observation_end,
+            (monitoring_run_id, ref_run_id, observation_start, observation_end,
              input_dataset_uri, drift_score_global, drift_detected,
-             alert_level, n_features_drifted)
+             alert_level, n_features_in_drift)
         VALUES
-            (%(monitoring_run_id)s, %(model_version)s, %(observation_start)s,
+            (%(monitoring_run_id)s, %(ref_run_id)s, %(observation_start)s,
              %(observation_end)s, %(input_dataset_uri)s, %(drift_score_global)s,
-             %(drift_detected)s, %(alert_level)s, %(n_features_drifted)s)
+             %(drift_detected)s, %(alert_level)s, %(n_features_in_drift)s)
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, {
                 "monitoring_run_id": monitoring_run_id,
-                "model_version": model_version,
+                "ref_run_id": ref_run_id,
                 "observation_start": observation_start,
                 "observation_end": observation_end,
                 "input_dataset_uri": input_dataset_uri,
                 "drift_score_global": drift_score_global,
                 "drift_detected": drift_detected,
                 "alert_level": alert_level,
-                "n_features_drifted": n_features_drifted,
+                "n_features_in_drift": n_features_drifted,
             })
 
     logger.info(
         "monitoring_run créé : id=%s | alert=%s | drift=%s | score=%.4f",
-        monitoring_run_id[:8], alert_level, drift_detected, drift_score_global
+        monitoring_run_id[:8], alert_level, drift_detected, drift_score_global,
     )
     return monitoring_run_id
 
@@ -364,9 +367,9 @@ def insert_drift_feature_metrics(
 
     feature_metrics : liste de dicts, un par feature, avec les clés :
         feature_name, psi, ks_stat, ks_pvalue,
-        mean_delta, mean_delta_pct, std_delta,
-        current_mean, current_std, current_q25, current_median, current_q75,
-        drift_flag
+        mean_ref, mean_cur, mean_delta,
+        std_ref, std_cur, std_delta,
+        drift_flag, drift_reason
 
     Returns:
         Nombre de lignes insérées.
@@ -374,14 +377,14 @@ def insert_drift_feature_metrics(
     sql = """
         INSERT INTO drift_feature_metrics
             (monitoring_run_id, feature_name, psi, ks_stat, ks_pvalue,
-             mean_delta, mean_delta_pct, std_delta,
-             current_mean, current_std, current_q25, current_median, current_q75,
-             drift_flag)
+             mean_ref, mean_cur, mean_delta,
+             std_ref, std_cur, std_delta,
+             drift_flag, drift_reason)
         VALUES
             (%(monitoring_run_id)s, %(feature_name)s, %(psi)s, %(ks_stat)s, %(ks_pvalue)s,
-             %(mean_delta)s, %(mean_delta_pct)s, %(std_delta)s,
-             %(current_mean)s, %(current_std)s, %(current_q25)s, %(current_median)s,
-             %(current_q75)s, %(drift_flag)s)
+             %(mean_ref)s, %(mean_cur)s, %(mean_delta)s,
+             %(std_ref)s, %(std_cur)s, %(std_delta)s,
+             %(drift_flag)s, %(drift_reason)s)
         ON CONFLICT (monitoring_run_id, feature_name) DO NOTHING
     """
     rows = [{"monitoring_run_id": monitoring_run_id, **m} for m in feature_metrics]
@@ -392,17 +395,17 @@ def insert_drift_feature_metrics(
 
     logger.info(
         "drift_feature_metrics insérées : %d features pour monitoring_run=%s",
-        len(rows), monitoring_run_id[:8]
+        len(rows), monitoring_run_id[:8],
     )
     return len(rows)
 
 
 def get_recent_monitoring_runs(
-    model_version: int,
+    ref_run_id: str,
     limit: int = 10,
 ) -> List[Dict]:
     """
-    Récupère les derniers runs de monitoring pour un modèle donné.
+    Récupère les derniers runs de monitoring pour un run de référence donné.
 
     Utilisé par le module alerting pour compter les alertes consécutives.
 
@@ -410,25 +413,25 @@ def get_recent_monitoring_runs(
         Liste de dicts triée du plus récent au plus ancien.
     """
     sql = """
-        SELECT monitoring_run_id, model_version, observation_start,
+        SELECT monitoring_run_id, ref_run_id, observation_start,
                observation_end, drift_score_global, drift_detected,
-               alert_level, n_features_drifted, created_at
+               alert_level, n_features_in_drift, created_at
         FROM drift_monitoring_runs
-        WHERE model_version = %(model_version)s
+        WHERE ref_run_id = %(ref_run_id)s
         ORDER BY created_at DESC
         LIMIT %(limit)s
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, {"model_version": model_version, "limit": limit})
+            cur.execute(sql, {"ref_run_id": ref_run_id, "limit": limit})
             rows = cur.fetchall()
 
     return [dict(r) for r in rows]
 
 
-def count_consecutive_alerts(model_version: int) -> int:
+def count_consecutive_alerts(ref_run_id: str) -> int:
     """
-    Compte le nombre d'alertes consécutives les plus récentes pour un modèle.
+    Compte le nombre d'alertes consécutives les plus récentes pour un run de référence.
 
     Logique : on remonte les runs du plus récent au plus ancien.
     On s'arrête dès qu'on rencontre un run sans alerte.
@@ -438,18 +441,17 @@ def count_consecutive_alerts(model_version: int) -> int:
     Cette valeur est utilisée par alerting.py pour décider
     si on doit déclencher un ré-entraînement.
     """
-    runs = get_recent_monitoring_runs(model_version, limit=20)
+    runs = get_recent_monitoring_runs(ref_run_id, limit=20)
 
     consecutive = 0
     for run in runs:
         if run["drift_detected"]:
             consecutive += 1
         else:
-            # Dès qu'on trouve un run sans alerte, on s'arrête
             break
 
     logger.info(
-        "Alertes consécutives pour model_version=%s : %d",
-        model_version, consecutive
+        "Alertes consécutives pour ref_run_id=%s : %d",
+        ref_run_id[:8], consecutive,
     )
     return consecutive

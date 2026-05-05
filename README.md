@@ -1,5 +1,9 @@
 # MLOps Drift Monitoring — Guide de démarrage
 
+## à modifier
+changer la fonction train pour ne plus enregistrer vers mlflow mais vers minio pour l'instant.
+ou carrément enregistrer les modèles en local de mem que les sorties html et autres.
+
 ## Architecture
 
 Lambda architecture simplifiée avec :
@@ -30,12 +34,13 @@ Airflow (DAGs)
 
 ```bash
 # Cloner / se placer dans le dossier du projet
-cd mlops_drift
+cd monitoring_ML
 
 # Rendre le script postgres exécutable
-chmod +x docker/postgres/init-multiple-dbs.sh
+chmod +x src/db/init-multiple-dbs.sh
 
 # Démarrer tous les services
+docker-compose build
 docker-compose up -d
 
 # Vérifier que tout est healthy (attendre ~2 min)

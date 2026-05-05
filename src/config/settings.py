@@ -32,8 +32,8 @@ class DataConfig:
 @dataclass
 class DriftConfig:
     """Paramètres pour simuler un drift de distribution."""
-    x2_mean_drifted: float = 4.0   # dérive de x2
-    x4_p_drifted: float = 0.7      # dérive de x4
+    x2_mean_drifted: float = 4.0
+    x4_p_drifted: float = 0.7
 
 
 @dataclass
@@ -44,30 +44,33 @@ class TrainingConfig:
 
 
 @dataclass
-class MLflowConfig:
-    tracking_uri: str = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-    experiment_name: str = os.getenv("MLFLOW_EXPERIMENT_NAME", "mlops_drift_monitoring")
-    artifact_root: str = os.getenv("MLFLOW_ARTIFACT_ROOT", "s3://mlflow-artifacts")
-
-
-@dataclass
 class MinIOConfig:
-    endpoint: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    # endpoint (SDK natif MinIO, non utilisé — conservé pour compatibilité)
+    endpoint: str = os.getenv("MINIO_ENDPOINT", "mlops-minio:9000")
+    # endpoint_url (boto3) — doit inclure le schéma http://
+    # La variable d'env est MINIO_ENDPOINTS (avec S) côté docker-compose
+    endpoint_url: str = os.getenv("MINIO_ENDPOINTS", "http://mlops-minio:9000")
     access_key: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
     secret_key: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
     secure: bool = False
+
+    # Bucket principal pour les artefacts de training (runs/<run_id>/)
+    bucket: str = "models"
+
+    # Liste complète des buckets à créer au démarrage via ensure_buckets_exist()
+    # IMPORTANT : "models" doit être dans cette liste
     buckets: list = field(default_factory=lambda: [
-        "mlflow-artifacts",
-        "raw-datasets",
-        "processed-datasets",
-        "feature-stats",
-        "monitoring-snapshots",
+        "models",               # artefacts de training (model.joblib, metrics, stats)
+        "raw-datasets",         # datasets bruts générés
+        "processed-datasets",   # datasets après preprocessing
+        "feature-stats",        # stats de référence indexées par date
+        "monitoring-snapshots", # snapshots des données de monitoring
     ])
 
 
 @dataclass
 class PostgresConfig:
-    host: str = os.getenv("POSTGRES_HOST", "localhost")
+    host: str = os.getenv("POSTGRES_HOST", "mlops-postgres")
     port: int = int(os.getenv("POSTGRES_PORT", "5432"))
     database: str = os.getenv("POSTGRES_DB", "mlops")
     user: str = os.getenv("POSTGRES_USER", "mlops")
@@ -87,15 +90,13 @@ class MonitoringConfig:
     psi_critical_threshold: float = 0.25
     n_critical_features_for_alert: int = 2
     consecutive_windows_for_retrain: int = 3
-    # Buckets PSI standard
     n_bins: int = 10
 
 
-# ── instances globales ──────────────────────────────────────────────────────
+# ── Instances globales ────────────────────────────────────────────────────────
 DATA_CFG = DataConfig()
 DRIFT_CFG = DriftConfig()
 TRAIN_CFG = TrainingConfig()
-MLFLOW_CFG = MLflowConfig()
 MINIO_CFG = MinIOConfig()
 PG_CFG = PostgresConfig()
 MONITOR_CFG = MonitoringConfig()

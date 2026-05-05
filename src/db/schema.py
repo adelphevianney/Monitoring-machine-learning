@@ -1,45 +1,39 @@
 """
 Schéma de la BD — migrations idempotentes lancées au début du service.
-utilsation de psycopg2
 """
 from __future__ import annotations
 
-from venv import logger
+import logging
+from pathlib import Path
 
 import psycopg2
 from psycopg2.extensions import connection as PgConnection
 
 from src.config.settings import PG_CFG
 
+logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-# DDL                                                                         #
-# --------------------------------------------------------------------------- #
+# Chemin absolu vers le SQL, indépendant du répertoire de lancement
+_SQL_PATH = Path(__file__).resolve().parent.parent / "sql" / "app_tables.sql"
 
-tables = "../sql/app_tables.sql"
-_SCHEMA_SQL = tables
-
-
-# --------------------------------------------------------------------------- #
-# Public API                                                                  #
-# --------------------------------------------------------------------------- #
 
 def get_connection() -> PgConnection:
-    """retourne une connection psycopg2 brut (la fermeture est la responsabilité du service qui l'appelle)."""
-    return psycopg2.connect(PG_CFG.db.dsn)
+    """Retourne une connexion psycopg2 brute (la fermeture est la responsabilité de l'appelant)."""
+    return psycopg2.connect(PG_CFG.dsn)
 
 
 def run_migrations() -> None:
-    """applique le schéma, c'est safe de l'appeler à chaque démarrage (à cause de l'idempotence)."""
-    logger.info("Running database migrations")
+    """Applique le schéma. Safe à appeler à chaque démarrage (idempotent grâce aux DROP IF EXISTS)."""
+    logger.info("Running database migrations from %s", _SQL_PATH)
+    sql = _SQL_PATH.read_text(encoding="utf-8")
     conn = get_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(_SCHEMA_SQL)
+                cur.execute(sql)
         logger.info("Database migrations completed successfully")
     except Exception as exc:
-        logger.error("Migration failed")
+        logger.error("Migration failed: %s", exc)
         raise
     finally:
         conn.close()

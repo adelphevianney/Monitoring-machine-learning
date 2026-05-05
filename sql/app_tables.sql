@@ -1,17 +1,18 @@
 -- =============================================================================
 -- TABLES APPLICATIVES — MLOps Drift Monitoring
--- =============================================================================
--- Ces tables sont SÉPARÉES des tables internes MLflow (qui gèrent elles-mêmes
--- leur propre schéma dans la même base Postgres).
+-- Base cible : mlops
 --
--- Pourquoi deux couches de tables ?
---   - MLflow stocke les runs, params, métriques d'entraînement
---   - Ces tables stockent l'état opérationnel du monitoring :
---     qui est en production, quels drifts ont été détectés, etc.
---
--- Le lien entre les deux : mlflow_run_id (UUID du run MLflow)
+-- Ce fichier est exécuté par docker-entrypoint-initdb.d/ APRÈS que
+-- init-multiple-dbs.sh a créé la base "mlops" et son user.
+-- Le SET search_path garantit que les tables atterrissent dans le bon schéma.
 -- =============================================================================
 
+-- Connexion explicite à la base mlops
+\connect mlops
+
+SET search_path TO public;
+
+-- Drop dans l'ordre inverse des FK pour éviter les erreurs de contrainte
 DROP TABLE IF EXISTS drift_feature_metrics CASCADE;
 DROP TABLE IF EXISTS drift_monitoring_runs CASCADE;
 DROP TABLE IF EXISTS reference_feature_stats CASCADE;
@@ -20,90 +21,102 @@ DROP TABLE IF EXISTS training_runs CASCADE;
 
 -- =============================================================================
 -- TABLE 1 : training_runs
+-- Historique de tous les runs d'entraînement.
+-- run_id = préfixe MinIO : runs/<run_id>/
 -- =============================================================================
 CREATE TABLE training_runs (
     id                 SERIAL PRIMARY KEY,
-    run_id             VARCHAR(64) UNIQUE NOT NULL,
-    mlflow_run_id      VARCHAR(64) UNIQUE,
+    run_id             VARCHAR(64)  UNIQUE NOT NULL,
     model_name         VARCHAR(128) NOT NULL,
-    model_version      VARCHAR(32),
-    model_stage        VARCHAR(32) DEFAULT 'None',
-    run_date           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    run_date           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     dataset_uri        TEXT,
     dataset_version    VARCHAR(64),
-    status             VARCHAR(32) DEFAULT 'running',
+    status             VARCHAR(32)  NOT NULL DEFAULT 'running',
+                       -- 'running' | 'success' | 'failed'
     n_rows             INTEGER,
     val_rmse           FLOAT,
     val_r2             FLOAT,
     train_duration_sec FLOAT,
-    created_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_training_runs_stage   ON training_runs(model_stage);
-CREATE INDEX idx_training_runs_rundate ON training_runs(run_date DESC);
-CREATE INDEX idx_training_runs_mlflow  ON training_runs(mlflow_run_id);
+CREATE INDEX idx_training_runs_model_status ON training_runs(model_name, status, run_date DESC);
+CREATE INDEX idx_training_runs_rundate      ON training_runs(run_date DESC);
 
 COMMENT ON TABLE training_runs IS
-    'Historique de tous les runs d entraînement. Lien vers MLflow via mlflow_run_id.';
+    'Historique des runs d entraînement. Artefacts dans MinIO sous runs/<run_id>/.';
+COMMENT ON COLUMN training_runs.run_id IS
+    'Identifiant unique du run = préfixe MinIO runs/<run_id>/.';
 
 
 -- =============================================================================
 -- TABLE 2 : reference_feature_stats
+-- Stats de distribution du dataset de référence, par feature et par run.
 -- =============================================================================
 CREATE TABLE reference_feature_stats (
-    id             SERIAL PRIMARY KEY,
-    mlflow_run_id  VARCHAR(64) NOT NULL REFERENCES training_runs(mlflow_run_id),
-    feature_name   VARCHAR(64) NOT NULL,
-    mean_value     FLOAT,
-    std_value      FLOAT,
-    min_value      FLOAT,
-    max_value      FLOAT,
-    q25            FLOAT,
-    median         FLOAT,
-    q75            FLOAT,
-    n_rows         INTEGER,
-    created_at     TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE (mlflow_run_id, feature_name)
+    id           SERIAL      PRIMARY KEY,
+    run_id       VARCHAR(64) NOT NULL REFERENCES training_runs(run_id) ON DELETE CASCADE,
+    feature_name VARCHAR(128) NOT NULL,
+    mean_value   FLOAT,
+    std_value    FLOAT,
+    min_value    FLOAT,
+    max_value    FLOAT,
+    q25          FLOAT,
+    median       FLOAT,
+    q75          FLOAT,
+    n_rows       INTEGER,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_ref_stats_run_feature UNIQUE (run_id, feature_name)
 );
 
-CREATE INDEX idx_ref_stats_runid   ON reference_feature_stats(mlflow_run_id);
+CREATE INDEX idx_ref_stats_runid   ON reference_feature_stats(run_id);
 CREATE INDEX idx_ref_stats_feature ON reference_feature_stats(feature_name);
+
+COMMENT ON TABLE reference_feature_stats IS
+    'Stats de référence par feature. Miroir du JSON MinIO sous runs/<run_id>/reference_stats/.';
 
 
 -- =============================================================================
 -- TABLE 3 : drift_monitoring_runs
+-- Résultat global de chaque exécution du DAG drift_monitoring_pipeline.
 -- =============================================================================
 CREATE TABLE drift_monitoring_runs (
-    id                        SERIAL PRIMARY KEY,
+    id                        SERIAL      PRIMARY KEY,
     monitoring_run_id         VARCHAR(64) UNIQUE NOT NULL,
-    model_version             VARCHAR(32),
-    mlflow_run_id_ref         VARCHAR(64),
-    observation_start         TIMESTAMP WITH TIME ZONE,
-    observation_end           TIMESTAMP WITH TIME ZONE,
-    input_dataset_uri         TEXT,
+    ref_run_id                VARCHAR(64) REFERENCES training_runs(run_id) ON DELETE RESTRICT,
+    observation_start         TIMESTAMPTZ,
+    observation_end           TIMESTAMPTZ,
+    input_dataset_uri         TEXT        NOT NULL DEFAULT '',
     n_rows_observed           INTEGER,
-    drift_score_global        FLOAT,
-    n_features_in_drift       INTEGER DEFAULT 0,
-    drift_detected            BOOLEAN DEFAULT FALSE,
-    alert_level               VARCHAR(32) DEFAULT 'none',
-    consecutive_drift_windows INTEGER DEFAULT 0,
-    retrain_triggered         BOOLEAN DEFAULT FALSE,
-    created_at                TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    drift_score_global        FLOAT       NOT NULL DEFAULT 0.0,
+    n_features_in_drift       INTEGER     NOT NULL DEFAULT 0,
+    drift_detected            BOOLEAN     NOT NULL DEFAULT FALSE,
+    alert_level               VARCHAR(32) NOT NULL DEFAULT 'none',
+                              -- 'none' | 'warning' | 'critical'
+    consecutive_drift_windows INTEGER     NOT NULL DEFAULT 0,
+    retrain_triggered         BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_monitoring_runs_alertlevel ON drift_monitoring_runs(alert_level);
-CREATE INDEX idx_monitoring_runs_created    ON drift_monitoring_runs(created_at DESC);
+CREATE INDEX idx_monitoring_runs_ref_run    ON drift_monitoring_runs(ref_run_id, created_at DESC);
+CREATE INDEX idx_monitoring_runs_alertlevel ON drift_monitoring_runs(alert_level, created_at DESC);
 CREATE INDEX idx_monitoring_runs_drift      ON drift_monitoring_runs(drift_detected, created_at DESC);
+
+COMMENT ON COLUMN drift_monitoring_runs.ref_run_id IS
+    'run_id du training run utilisé comme référence pour ce check de drift.';
 
 
 -- =============================================================================
 -- TABLE 4 : drift_feature_metrics
+-- Détail du drift par feature pour chaque monitoring_run.
 -- =============================================================================
 CREATE TABLE drift_feature_metrics (
-    id                SERIAL PRIMARY KEY,
-    monitoring_run_id VARCHAR(64) NOT NULL REFERENCES drift_monitoring_runs(monitoring_run_id),
-    feature_name      VARCHAR(64) NOT NULL,
+    id                SERIAL      PRIMARY KEY,
+    monitoring_run_id VARCHAR(64) NOT NULL
+                      REFERENCES drift_monitoring_runs(monitoring_run_id) ON DELETE CASCADE,
+    feature_name      VARCHAR(128) NOT NULL,
     psi               FLOAT,
     ks_stat           FLOAT,
     ks_pvalue         FLOAT,
@@ -113,10 +126,11 @@ CREATE TABLE drift_feature_metrics (
     std_ref           FLOAT,
     std_cur           FLOAT,
     std_delta         FLOAT,
-    drift_flag        BOOLEAN DEFAULT FALSE,
-    drift_reason      TEXT,
-    created_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE (monitoring_run_id, feature_name)
+    drift_flag        BOOLEAN NOT NULL DEFAULT FALSE,
+    drift_reason      TEXT    NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_drift_metrics_run_feature UNIQUE (monitoring_run_id, feature_name)
 );
 
 CREATE INDEX idx_drift_metrics_runid   ON drift_feature_metrics(monitoring_run_id);
@@ -138,7 +152,7 @@ SELECT
     mr.retrain_triggered,
     STRING_AGG(
         CASE WHEN fm.drift_flag
-            THEN fm.feature_name || '(PSI=' || ROUND(fm.psi::numeric, 3) || ')'
+            THEN fm.feature_name || ' (PSI=' || ROUND(fm.psi::numeric, 3) || ')'
         END,
         ', ' ORDER BY fm.psi DESC
     ) AS drifted_features
@@ -165,3 +179,39 @@ SELECT
 FROM drift_monitoring_runs
 ORDER BY created_at DESC
 LIMIT 30;
+
+-- =============================================================================
+-- PERMISSIONS — accorder tous les droits à l'utilisateur applicatif mlops
+--
+-- POURQUOI : ce fichier est exécuté par le superuser postgres dans
+-- docker-entrypoint-initdb.d/. Les tables sont donc owned par postgres.
+-- Sans ces GRANT, l'utilisateur mlops peut se connecter à la base
+-- mais ne peut ni lire ni écrire dans les tables.
+--
+-- ALTER DEFAULT PRIVILEGES couvre les objets créés APRÈS ce script
+-- (ex: séquences créées lors des premiers INSERT sur les colonnes SERIAL).
+-- =============================================================================
+
+-- Tables
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    training_runs,
+    reference_feature_stats,
+    drift_monitoring_runs,
+    drift_feature_metrics
+TO mlops;
+
+-- Vues (lecture seule)
+GRANT SELECT ON
+    v_latest_drift_status,
+    v_alert_history
+TO mlops;
+
+-- Séquences SERIAL (nécessaire pour les INSERT avec id auto-incrémenté)
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mlops;
+
+-- Droits par défaut pour les futurs objets créés par postgres dans cette base
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mlops;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO mlops;
