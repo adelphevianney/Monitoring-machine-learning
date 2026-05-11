@@ -1,63 +1,55 @@
 ---
 # =============================================================================
-# Stack MLOps — Drift Monitoring
+# Stack MLOps v2 — Drift Monitoring + Elasticsearch + Kibana + MLflow
 # =============================================================================
 #
-# SERVICES :
-#   postgres          : base de données partagée (Airflow + tables applicatives)
-#   minio             : data lake objet (datasets, artefacts, snapshots)
-#   minio-init        : crée les buckets au démarrage (one-shot)
-#   airflow-init      : initialise la base Airflow + crée l'utilisateur admin
-#   airflow-webserver : interface web Airflow
-#   airflow-scheduler : exécute les DAGs
-#
-# DÉMARRAGE :
-#   docker-compose up -d
-#
 # ACCÈS :
-#   Airflow UI  : http://localhost:8080  (admin / admin)
-#   MinIO UI    : http://localhost:9001  (minioadmin / minioadmin)
-#   Postgres    : localhost:5432         (mlops / mlops)
+#   Airflow UI      : http://localhost:8080  (admin / admin)
+#   MLflow UI       : http://localhost:5000
+#   MinIO UI        : http://localhost:9001  (minioadmin / minioadmin)
+#   Kibana UI       : http://localhost:5601
+#   Elasticsearch   : http://localhost:9200
+#   Postgres        : localhost:5432         (mlops / mlops)
 #
-# ARRÊT + NETTOYAGE :
-#   docker-compose down -v
+# DÉMARRAGE :   docker-compose up -d
+# NETTOYAGE :   docker-compose down -v
 # =============================================================================
 
 x-airflow-common:
   &airflow-common
   build:
     context: .
-    dockerfile: Dockerfile
+    dockerfile: docker/airflow/Dockerfile
   environment:
     &airflow-common-env
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW_CONN_POSTGRES_MLOPS: postgresql://mlops:mlops@postgres:5432/mlops
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
 
-    # Postgres applicatif (base mlops)
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
     POSTGRES_DB: mlops
     POSTGRES_USER: mlops
     POSTGRES_PASSWORD: mlops
-
-    # MinIO
     MINIO_ENDPOINTS: http://mlops-minio:9000
     MINIO_ENDPOINT: mlops-minio:9000
     MINIO_ACCESS_KEY: minioadmin
     MINIO_SECRET_KEY: minioadmin
     AWS_ACCESS_KEY_ID: minioadmin
     AWS_SECRET_ACCESS_KEY: minioadmin
+    MLFLOW_TRACKING_URI: http://mlops-mlflow:5000
+    MLFLOW_S3_ENDPOINT_URL: http://mlops-minio:9000
+    ELASTICSEARCH_URL: http://mlops-elasticsearch:9200
 
-    # Variables Airflow pour les DAGs
     AIRFLOW_VAR_MODEL_NAME: drift_regressor
+    AIRFLOW_VAR_MODEL_TYPE: random_forest
     AIRFLOW_VAR_MIN_R2_FOR_REGISTRY: "0.70"
     AIRFLOW_VAR_N_ROWS_TRAINING: "5000"
     AIRFLOW_VAR_N_ROWS_MONITORING: "1000"
+    # 0.0=stable → 1.0=drift total. Modifier depuis Airflow Admin > Variables.
     AIRFLOW_VAR_DRIFT_SIMULATION_FACTOR: "0.0"
 
   volumes:
@@ -71,22 +63,24 @@ x-airflow-common:
       condition: service_healthy
     minio:
       condition: service_healthy
+    elasticsearch:
+      condition: service_healthy
+    mlflow:
+      condition: service_healthy
 
 
 services:
 
   # ===========================================================================
   # POSTGRES
-  #
-  # Ordre d'exécution de docker-entrypoint-initdb.d/ (alphabétique) :
-  #   1_init_databases.sh   → crée les bases airflow et mlops avec leurs users
-  #   2_app_tables.sql      → crée les tables applicatives dans la base mlops
-  #
-  # IMPORTANT : le préfixe numérique garantit l'ordre d'exécution.
-  # app_tables.sql doit impérativement tourner APRÈS la création de la base mlops.
+  # Ordre d'exécution docker-entrypoint-initdb.d/ (alphabétique) :
+  #   1_init_databases.sh → crée airflow + mlops avec leurs users
+  #   2_app_tables.sql    → crée les tables applicatives dans mlops
   # ===========================================================================
   postgres:
-    image: postgres:15-alpine
+    build:
+      context: .
+      dockerfile: docker/postgres/Dockerfile
     container_name: mlops-postgres
     environment:
       POSTGRES_USER: postgres
@@ -94,17 +88,15 @@ services:
       POSTGRES_MULTIPLE_DATABASES: "airflow:airflow:airflow,mlops:mlops:mlops"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      # 1 — crée les bases et users (doit tourner en premier)
-      - ./src/db/init-multiple-dbs.sh:/docker-entrypoint-initdb.d/1_init_databases.sh
-      # 2 — crée les tables applicatives dans la base mlops (doit tourner après)
-      - ./sql/app_tables.sql:/docker-entrypoint-initdb.d/2_app_tables.sql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost", "-d", "postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - mlops-network
     restart: unless-stopped
 
   # ===========================================================================
@@ -127,6 +119,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - mlops-network
     restart: unless-stopped
 
   # ===========================================================================
@@ -146,9 +140,104 @@ services:
         mc mb --ignore-existing local/processed-datasets;
         mc mb --ignore-existing local/feature-stats;
         mc mb --ignore-existing local/monitoring-snapshots;
+        mc mb --ignore-existing local/mlflow-artifacts;
         echo 'Buckets créés.';
       "
+    networks:
+      - mlops-network
     restart: "no"
+
+  # ===========================================================================
+  # MLFLOW — tracking server + model registry
+  # Backend : Postgres (base mlops)
+  # Artefacts : MinIO bucket mlflow-artifacts
+  # ===========================================================================
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    container_name: mlops-mlflow
+    command: >
+      mlflow server
+        --backend-store-uri postgresql://mlops:mlops@postgres/mlops
+        --default-artifact-root s3://mlflow-artifacts/
+        --host 0.0.0.0
+        --port 5000
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://mlops-minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  # ===========================================================================
+  # ELASTICSEARCH — indexation des métriques de drift
+  # Mode single-node, sécurité désactivée (dev local)
+  # Index créés par es_client.py au premier run du monitoring :
+  #   drift-monitoring-runs    : résultat global par fenêtre d'observation
+  #   drift-feature-metrics    : détail par feature
+  # ===========================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: mlops-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health?wait_for_status=yellow"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  # ===========================================================================
+  # KIBANA — dashboard de visualisation du drift
+  # Importer le dashboard : src/kibana/dashboards/drift_dashboard.ndjson
+  #   Stack Management > Saved Objects > Import
+  # ===========================================================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: mlops-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://mlops-elasticsearch:9200
+      XPACK_SECURITY_ENABLED: "false"
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5601/api/status"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - mlops-network
+    restart: unless-stopped
 
   # ===========================================================================
   # AIRFLOW INIT
@@ -162,16 +251,25 @@ services:
       - |
         airflow db upgrade
         airflow users create \
-          --username airflow \
+          --username admin \
           --firstname Admin \
           --lastname MLOps \
           --role Admin \
           --email admin@mlops.local \
-          --password airflow
+          --password admin
         echo "Airflow initialisé."
     environment:
       <<: *airflow-common-env
       _AIRFLOW_DB_UPGRADE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - mlops-network
     restart: "no"
 
   # ===========================================================================
@@ -192,6 +290,8 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - mlops-network
     restart: unless-stopped
 
   # ===========================================================================
@@ -210,6 +310,8 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    networks:
+      - mlops-network
     restart: unless-stopped
 
 
@@ -223,3 +325,12 @@ volumes:
     driver: local
   airflow-logs:
     driver: local
+  elasticsearch-data:
+    driver: local
+
+# =============================================================================
+# NETWORK
+# =============================================================================
+networks:
+  mlops-network:
+    driver: bridge

@@ -1,0 +1,21 @@
+# =============================================================================
+# requirements/dev.txt
+# Outils de développement et de test.
+#
+# Usage :
+#   pip install -r requirements/app.txt -r requirements/dev.txt
+#
+# Non installé dans les conteneurs de production.
+# =============================================================================
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# ── Qualité de code ───────────────────────────────────────────────────────────
+ruff>=0.3.0                # linter + formatter (remplace flake8 + black)
+mypy>=1.9.0                # type checking
+
+# ── Utilitaires dev ───────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+ipython>=8.0.0             # REPL enrichi pour exploration des données

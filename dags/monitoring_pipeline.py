@@ -1,40 +1,31 @@
 """
-DAG : drift_monitoring_pipeline
-────────────────────────────────
-Monitoring du drift basé sur MinIO + Postgres.
-Pas de MLflow : le modèle de référence est résolu depuis Postgres (training_runs).
+DAG : drift_monitoring_pipeline (v2)
+─────────────────────────────────────
+Monitoring du drift — MinIO + Postgres + Elasticsearch + Kibana.
 
-FLUX DES DONNÉES
-────────────────
-  1. load_reference_run   — charge le dernier run réussi depuis Postgres
-                            (run_id, dataset_uri, features)
-  2. collect_current_data — génère un snapshot de données courantes,
-                            l'upload dans MinIO (monitoring-snapshots)
-  3. compute_drift        — calcule les métriques de drift (PSI, KS)
-                            via drift_metrics.compute_drift_report()
-  4. store_results        — persiste dans Postgres :
-                              • drift_monitoring_runs (résultat global)
-                              • drift_feature_metrics (détail par feature)
-  5. evaluate_alert       — BranchOperator : 'log_alert_only' ou 'trigger_retraining'
-  6a. log_alert_only      — log du niveau d'alerte
-  6b. trigger_retraining  — déclenche le DAG training_pipeline
-  7. pipeline_done        — fin
+NOUVEAUTÉS v2
+─────────────
+  • Snapshots JSON dans MinIO en plus du parquet (lisibles, archivables)
+  • Indexation dans Elasticsearch → visualisation Kibana en temps réel
+  • Nouveaux tests de drift : Wasserstein + Chi² (x4) + Jensen-Shannon
+  • DRIFT_SIMULATION_FACTOR pilotable depuis Airflow Admin > Variables
+    0.0 = stable | 0.5 = drift partiel | 1.0 = drift complet
+  • Tâche dédiée index_elasticsearch (découplée, non bloquante)
 
-VARIABLES AIRFLOW REQUISES (Admin → Variables)
+FLUX
+────
+  1. load_reference_run   → Postgres : dernier run réussi
+  2. collect_current_data → snapshot parquet + JSON metadata → MinIO
+  3. compute_drift        → PSI + KS/Chi² + Wasserstein + JS
+  4. store_postgres       → drift_monitoring_runs + drift_feature_metrics
+  5. index_elasticsearch  → ES (non bloquant) + snapshot JSON complet → MinIO
+  6. evaluate_alert       → branch : log_alert_only | trigger_retraining
+  7. pipeline_done
+
+VARIABLES AIRFLOW (Admin → Variables)
   MODEL_NAME                  : drift_regressor
-  DRIFT_SIMULATION_FACTOR     : 0.0  (0 = stable, 1 = drift total)
+  DRIFT_SIMULATION_FACTOR     : 0.0  (0=stable → 1=drift total)
   N_ROWS_MONITORING           : 1000
-
-CORRECTION PAR RAPPORT À LA VERSION PRÉCÉDENTE
-───────────────────────────────────────────────
-- Plus de métadonnées MLflow (model_version, metadata.json)
-- La référence est résolue via postgres_client.get_latest_successful_run()
-- insert_monitoring_run() reçoit ref_run_id (pas model_version)
-- count_consecutive_alerts() reçoit ref_run_id (pas model_version)
-- insert_drift_feature_metrics() reçoit une liste de dicts
-  (produite par drift_metrics.feature_results_to_rows)
-- alerting.build_monitoring_verdict() consomme des FeatureDriftResult
-  directement (plus de conversion Dict intermédiaire)
 """
 
 import logging
@@ -59,66 +50,42 @@ DEFAULT_ARGS = {
 
 with DAG(
     dag_id="drift_monitoring_pipeline",
-    description="Monitoring du drift (MinIO + Postgres, sans MLflow)",
+    description="Monitoring du drift v2 — MinIO + Postgres + Elasticsearch",
     schedule_interval="@hourly",
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["mlops", "monitoring", "drift"],
+    tags=["mlops", "monitoring", "drift", "elasticsearch"],
     max_active_runs=1,
 ) as dag:
 
     # ─────────────────────────────────────────────────────────
-    # 1. LOAD REFERENCE RUN FROM POSTGRES
+    # 1. LOAD REFERENCE RUN
     # ─────────────────────────────────────────────────────────
     def _load_reference_run(**context):
-        """
-        Charge le dernier run d'entraînement réussi depuis Postgres.
-
-        Retourne via XCom :
-          - run_id       : identifiant du run (préfixe MinIO)
-          - dataset_uri  : URI MinIO du dataset de référence
-          - features     : liste des features utilisées à l'entraînement
-          - model_name   : nom du modèle
-        """
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
         from src.storage.postgres_client import get_latest_successful_run
+        from src.storage.minio_client import download_json
+        from src.config.settings import MINIO_CFG
 
         model_name = Variable.get("MODEL_NAME", default_var="drift_regressor")
         run_info = get_latest_successful_run(model_name)
 
         if not run_info:
-            log.warning("Aucun run réussi pour '%s'", model_name)
             raise AirflowSkipException(f"Pas de run réussi pour '{model_name}'")
-
-        # Charger les tags du run pour récupérer les features
-        from src.storage.minio_client import download_json
-        from src.config.settings import MINIO_CFG
 
         run_id = run_info["run_id"]
         try:
-            tags = download_json(
-                bucket=MINIO_CFG.bucket,
-                object_name=f"runs/{run_id}/tags.json",
-            )
+            tags = download_json(bucket=MINIO_CFG.bucket, object_name=f"runs/{run_id}/tags.json")
             features = tags.get("features", [])
         except Exception as exc:
-            log.warning("Impossible de charger tags.json pour run_id=%s : %s", run_id, exc)
+            log.warning("tags.json introuvable : %s", exc)
             features = []
 
-        log.info(
-            "Run de référence : run_id=%s | dataset=%s | %d features",
-            run_id, run_info["dataset_uri"], len(features),
-        )
-
-        return {
-            "run_id": run_id,
-            "dataset_uri": run_info["dataset_uri"],
-            "features": features,
-            "model_name": model_name,
-        }
+        log.info("Référence : run_id=%s | %d features", run_id[:8], len(features))
+        return {"run_id": run_id, "dataset_uri": run_info["dataset_uri"], "features": features}
 
     load_reference_run = PythonOperator(
         task_id="load_reference_run",
@@ -130,48 +97,56 @@ with DAG(
     # ─────────────────────────────────────────────────────────
     def _collect_current_data(**context):
         """
-        Génère un snapshot de données courantes et l'upload dans MinIO.
+        Génère le snapshot courant et l'upload dans MinIO.
 
-        Retourne via XCom :
-          - snapshot_uri : URI MinIO du snapshot
-          - window_start : début de la fenêtre d'observation (ISO)
-          - window_end   : fin de la fenêtre d'observation (ISO)
+        DRIFT_SIMULATION_FACTOR (Airflow Variable) :
+          0.0 → données stables   (tests de non-régression)
+          0.5 → drift partiel     (simulation réaliste)
+          1.0 → drift complet     (test des alertes)
         """
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
         from src.data_generation.generator import generate_partial_drift
-        from src.storage.minio_client import upload_dataframe, make_snapshot_object_name
+        from src.storage.minio_client import (
+            upload_dataframe, upload_json, make_snapshot_object_name,
+        )
 
         exec_date = context["execution_date"]
         window_start = exec_date - timedelta(hours=1)
         window_end = exec_date
 
-        drift_factor = float(Variable.get("DRIFT_SIMULATION_FACTOR", default_var=0.0))
+        drift_factor = float(Variable.get("DRIFT_SIMULATION_FACTOR", default_var=1.0))
         n_rows = int(Variable.get("N_ROWS_MONITORING", default_var=1000))
         seed = int(exec_date.timestamp()) % 100_000
 
-        df_current = generate_partial_drift(
-            drift_factor=drift_factor,
-            n_rows=n_rows,
-            seed=seed,
-        )
+        df_current = generate_partial_drift(drift_factor=drift_factor, n_rows=n_rows, seed=seed)
 
+        # Parquet (données brutes pour calcul du drift)
         object_name = make_snapshot_object_name(window_start, window_end)
-        snapshot_uri = upload_dataframe(
-            df_current,
+        snapshot_uri = upload_dataframe(df_current, bucket="monitoring-snapshots", object_name=object_name)
+
+        # JSON metadata (v2 — lisible, archivable)
+        json_name = object_name.replace(".parquet", "_metadata.json")
+        upload_json(
+            {
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "drift_factor": drift_factor,
+                "n_rows": n_rows,
+                "seed": seed,
+                "snapshot_uri": snapshot_uri,
+            },
             bucket="monitoring-snapshots",
-            object_name=object_name,
+            object_name=json_name,
         )
 
-        log.info(
-            "Snapshot uploadé : %s (%d lignes, drift_factor=%.2f)",
-            snapshot_uri, n_rows, drift_factor,
-        )
+        log.info("Snapshot : %s (%d lignes, factor=%.2f)", snapshot_uri, n_rows, drift_factor)
         return {
             "snapshot_uri": snapshot_uri,
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
+            "drift_factor": drift_factor,
         }
 
     collect_current_data = PythonOperator(
@@ -184,26 +159,13 @@ with DAG(
     # ─────────────────────────────────────────────────────────
     def _compute_drift(**context):
         """
-        Calcule les métriques de drift entre référence et données courantes.
-
-        Utilise drift_metrics.compute_drift_report() qui retourne
-        Dict[str, FeatureDriftResult].
-
-        Retourne via XCom un dict sérialisable (pas de dataclasses) :
-          - feature_metrics  : {fname: {psi, ks_stat, ...}}
-          - global_score     : float
-          - alert_level      : 'none' | 'warning' | 'critical'
-          - drift_detected   : bool
-          - n_features_drifted: int
-          - should_retrain   : bool
+        Calcule PSI + KS/Chi² + Wasserstein + Jensen-Shannon.
+        Sélection automatique du test selon le type de variable.
         """
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
-        from src.monitoring.drift_metrics import (
-            compute_drift_report,
-            feature_results_to_rows,
-        )
+        from src.monitoring.drift_metrics import compute_drift_report, feature_results_to_rows
         from src.monitoring.alerting import build_monitoring_verdict
         from src.storage.minio_client import download_dataframe_from_uri
         from src.storage.postgres_client import count_consecutive_alerts
@@ -212,32 +174,20 @@ with DAG(
         ref_info = ti.xcom_pull(task_ids="load_reference_run")
         data_info = ti.xcom_pull(task_ids="collect_current_data")
 
-        df_reference = download_dataframe_from_uri(ref_info["dataset_uri"])
-        df_current = download_dataframe_from_uri(data_info["snapshot_uri"])
+        df_ref = download_dataframe_from_uri(ref_info["dataset_uri"])
+        df_cur = download_dataframe_from_uri(data_info["snapshot_uri"])
 
-        features = ref_info.get("features") or [
-            c for c in df_reference.columns if c != "y"
-        ]
+        features = ref_info.get("features") or [c for c in df_ref.columns if c != "y"]
 
-        # Calcul du drift — retourne Dict[str, FeatureDriftResult]
-        feature_results = compute_drift_report(df_reference, df_current, features)
-
-        # Compter les alertes consécutives pour la décision de ré-entraînement
+        feature_results = compute_drift_report(df_ref, df_cur, features)
         n_consecutive = count_consecutive_alerts(ref_info["run_id"])
-
-        # Verdict global (alerte + décision retrain)
         verdict = build_monitoring_verdict(feature_results, consecutive_alerts=n_consecutive)
 
-        log.info(
-            "Drift calculé : alert=%s | score=%.4f | %d features driftées",
-            verdict.alert_level, verdict.drift_score_global, verdict.n_features_drifted,
-        )
-
-        # Sérialisation pour XCom (pas de dataclasses)
-        feature_metrics_rows = feature_results_to_rows(feature_results)
+        log.info("Drift : alert=%s | score=%.4f | %d drifted",
+                 verdict.alert_level, verdict.drift_score_global, verdict.n_features_drifted)
 
         return {
-            "feature_metrics": feature_metrics_rows,
+            "feature_metrics": feature_results_to_rows(feature_results),
             "global_score": verdict.drift_score_global,
             "alert_level": verdict.alert_level,
             "drift_detected": verdict.drift_detected,
@@ -252,31 +202,19 @@ with DAG(
     )
 
     # ─────────────────────────────────────────────────────────
-    # 4. STORE RESULTS IN POSTGRES
+    # 4. STORE IN POSTGRES
     # ─────────────────────────────────────────────────────────
-    def _store_monitoring_results(**context):
-        """
-        Persiste dans Postgres :
-          - drift_monitoring_runs  : résultat global du run
-          - drift_feature_metrics  : détail par feature
-
-        Retourne via XCom :
-          - monitoring_run_id : UUID du run de monitoring
-        """
+    def _store_postgres(**context):
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
-        from src.storage.postgres_client import (
-            insert_monitoring_run,
-            insert_drift_feature_metrics,
-        )
+        from src.storage.postgres_client import insert_monitoring_run, insert_drift_feature_metrics
 
         ti = context["ti"]
-        ref_info = ti.xcom_pull(task_ids="load_reference_run")
+        ref_info  = ti.xcom_pull(task_ids="load_reference_run")
         data_info = ti.xcom_pull(task_ids="collect_current_data")
         drift_info = ti.xcom_pull(task_ids="compute_drift")
 
-        # insert_monitoring_run attend ref_run_id (pas model_version)
         monitoring_run_id = insert_monitoring_run(
             ref_run_id=ref_info["run_id"],
             observation_start=datetime.fromisoformat(data_info["window_start"]),
@@ -288,47 +226,107 @@ with DAG(
             input_dataset_uri=data_info["snapshot_uri"],
         )
 
-        # insert_drift_feature_metrics attend une List[Dict]
-        # (déjà sérialisée par feature_results_to_rows dans la tâche précédente)
-        insert_drift_feature_metrics(
-            monitoring_run_id,
-            drift_info["feature_metrics"],
-        )
+        insert_drift_feature_metrics(monitoring_run_id, drift_info["feature_metrics"])
 
-        log.info(
-            "Résultats persistés : monitoring_run_id=%s | alert=%s",
-            monitoring_run_id[:8], drift_info["alert_level"],
-        )
+        log.info("Postgres OK : %s | alert=%s", monitoring_run_id[:8], drift_info["alert_level"])
         return {"monitoring_run_id": monitoring_run_id}
 
-    store_monitoring_results = PythonOperator(
-        task_id="store_monitoring_results",
-        python_callable=_store_monitoring_results,
+    store_postgres = PythonOperator(
+        task_id="store_postgres",
+        python_callable=_store_postgres,
     )
 
     # ─────────────────────────────────────────────────────────
-    # 5. EVALUATE ALERT (branch)
+    # 5. INDEX ELASTICSEARCH (non bloquant)
     # ─────────────────────────────────────────────────────────
-    def _evaluate_alert(**context):
+    def _index_elasticsearch(**context):
         """
-        Décide du chemin à suivre selon le verdict de drift.
-
-        should_retrain=True → 'trigger_retraining'
-        sinon               → 'log_alert_only'
+        Indexe dans ES et uploade le snapshot JSON complet dans MinIO.
+        Les erreurs ES ne font pas échouer le DAG.
         """
         import sys
         sys.path.insert(0, "/opt/airflow/project")
 
+        from src.storage.es_client import (
+            ensure_indices_exist,
+            index_monitoring_run,
+            index_feature_metrics,
+            build_monitoring_snapshot_json,
+        )
+        from src.storage.minio_client import upload_json, make_snapshot_object_name
+
+        ti = context["ti"]
+        ref_info   = ti.xcom_pull(task_ids="load_reference_run")
+        data_info  = ti.xcom_pull(task_ids="collect_current_data")
+        drift_info = ti.xcom_pull(task_ids="compute_drift")
+        store_info = ti.xcom_pull(task_ids="store_postgres")
+
+        monitoring_run_id = store_info["monitoring_run_id"]
+        obs_start = datetime.fromisoformat(data_info["window_start"])
+        obs_end   = datetime.fromisoformat(data_info["window_end"])
+
+        # ── Elasticsearch ──────────────────────────────────────────────────
+        try:
+            ensure_indices_exist()
+            index_monitoring_run(
+                monitoring_run_id=monitoring_run_id,
+                ref_run_id=ref_info["run_id"],
+                observation_start=obs_start,
+                observation_end=obs_end,
+                drift_score_global=drift_info["global_score"],
+                drift_detected=drift_info["drift_detected"],
+                alert_level=drift_info["alert_level"],
+                n_features_drifted=drift_info["n_features_drifted"],
+                input_dataset_uri=data_info["snapshot_uri"],
+                feature_metrics=drift_info["feature_metrics"],
+            )
+            n_ok = index_feature_metrics(
+                monitoring_run_id=monitoring_run_id,
+                ref_run_id=ref_info["run_id"],
+                observation_start=obs_start,
+                alert_level=drift_info["alert_level"],
+                feature_metrics=drift_info["feature_metrics"],
+            )
+            log.info("ES : %d features indexées pour %s", n_ok, monitoring_run_id[:8])
+        except Exception as exc:
+            log.error("ES indexation échouée (non bloquant) : %s", exc)
+
+        # ── Snapshot JSON complet dans MinIO ───────────────────────────────
+        try:
+            snapshot_json = build_monitoring_snapshot_json(
+                monitoring_run_id=monitoring_run_id,
+                ref_run_id=ref_info["run_id"],
+                observation_start=obs_start,
+                observation_end=obs_end,
+                drift_score_global=drift_info["global_score"],
+                drift_detected=drift_info["drift_detected"],
+                alert_level=drift_info["alert_level"],
+                n_features_drifted=drift_info["n_features_drifted"],
+                input_dataset_uri=data_info["snapshot_uri"],
+                feature_metrics=drift_info["feature_metrics"],
+            )
+            json_name = make_snapshot_object_name(obs_start, obs_end).replace(
+                ".parquet", f"_drift_{monitoring_run_id[:8]}.json"
+            )
+            uri = upload_json(snapshot_json, bucket="monitoring-snapshots", object_name=json_name)
+            log.info("Snapshot JSON : %s", uri)
+        except Exception as exc:
+            log.error("Upload snapshot JSON échoué (non bloquant) : %s", exc)
+
+    index_elasticsearch = PythonOperator(
+        task_id="index_elasticsearch",
+        python_callable=_index_elasticsearch,
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # 6. EVALUATE ALERT
+    # ─────────────────────────────────────────────────────────
+    def _evaluate_alert(**context):
         ti = context["ti"]
         drift_info = ti.xcom_pull(task_ids="compute_drift")
-
         if drift_info["should_retrain"]:
-            log.info(
-                "Ré-entraînement déclenché : %s",
-                drift_info.get("retrain_reason", ""),
-            )
+            log.info("Retrain déclenché : %s", drift_info.get("retrain_reason", ""))
             return "trigger_retraining"
-
         return "log_alert_only"
 
     evaluate_alert = BranchPythonOperator(
@@ -336,43 +334,24 @@ with DAG(
         python_callable=_evaluate_alert,
     )
 
-    # ─────────────────────────────────────────────────────────
-    # 6a. LOG ONLY
-    # ─────────────────────────────────────────────────────────
     def _log_alert_only(**context):
         ti = context["ti"]
-        drift_info = ti.xcom_pull(task_ids="compute_drift")
-        log.info(
-            "ALERTE: %s | score=%.4f | drifted=%d | retrain=non",
-            drift_info["alert_level"],
-            drift_info["global_score"],
-            drift_info["n_features_drifted"],
-        )
+        d = ti.xcom_pull(task_ids="compute_drift")
+        log.info("ALERTE: %s | score=%.4f | drifted=%d",
+                 d["alert_level"], d["global_score"], d["n_features_drifted"])
 
-    log_alert_only = PythonOperator(
-        task_id="log_alert_only",
-        python_callable=_log_alert_only,
-    )
+    log_alert_only = PythonOperator(task_id="log_alert_only", python_callable=_log_alert_only)
 
-    # ─────────────────────────────────────────────────────────
-    # 6b. TRIGGER RETRAINING
-    # ─────────────────────────────────────────────────────────
     trigger_retraining = TriggerDagRunOperator(
         task_id="trigger_retraining",
         trigger_dag_id="training_pipeline",
-        conf={"triggered_by": "drift_monitoring"},
+        conf={"triggered_by": "drift_monitoring_v2"},
         wait_for_completion=False,
     )
 
-    # ─────────────────────────────────────────────────────────
-    # 7. END
-    # ─────────────────────────────────────────────────────────
-    def _done(**context):
-        log.info("Pipeline de monitoring terminé.")
-
     pipeline_done = PythonOperator(
         task_id="pipeline_done",
-        python_callable=_done,
+        python_callable=lambda **kw: log.info("Pipeline monitoring v2 terminé."),
         trigger_rule=TriggerRule.ONE_SUCCESS,
     )
 
@@ -383,7 +362,8 @@ with DAG(
         load_reference_run
         >> collect_current_data
         >> compute_drift
-        >> store_monitoring_results
+        >> store_postgres
+        >> index_elasticsearch
         >> evaluate_alert
         >> [log_alert_only, trigger_retraining]
         >> pipeline_done

@@ -3,3 +3,4 @@
 3. es_client.py    → nouveau module d'indexation
 4. drift_metrics   → nouveaux tests (point 5)
 5. monitoring_pipeline → tâche ES + données driftées (points 1, 2, 4)
+6. faire plusieurs fichiers requirements pour chaque conteneur que chacun est ses dépendances, implique de faire autant de fichier Dockerfile

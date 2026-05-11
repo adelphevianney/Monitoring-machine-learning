@@ -365,29 +365,54 @@ def insert_drift_feature_metrics(
     """
     Persiste le détail du drift par feature pour un monitoring_run.
 
-    feature_metrics : liste de dicts, un par feature, avec les clés :
-        feature_name, psi, ks_stat, ks_pvalue,
-        mean_ref, mean_cur, mean_delta,
-        std_ref, std_cur, std_delta,
-        drift_flag, drift_reason
+    Colonnes v2 incluses :
+        is_binary, chi2_stat, chi2_pvalue,
+        wasserstein, wasserstein_norm, js_divergence
+
+    feature_metrics : liste de dicts issus de drift_metrics.feature_results_to_rows()
 
     Returns:
         Nombre de lignes insérées.
     """
     sql = """
         INSERT INTO drift_feature_metrics
-            (monitoring_run_id, feature_name, psi, ks_stat, ks_pvalue,
+            (monitoring_run_id, feature_name,
+             is_binary,
+             psi,
+             ks_stat, ks_pvalue,
+             chi2_stat, chi2_pvalue,
+             wasserstein, wasserstein_norm,
+             js_divergence,
              mean_ref, mean_cur, mean_delta,
              std_ref, std_cur, std_delta,
              drift_flag, drift_reason)
         VALUES
-            (%(monitoring_run_id)s, %(feature_name)s, %(psi)s, %(ks_stat)s, %(ks_pvalue)s,
+            (%(monitoring_run_id)s, %(feature_name)s,
+             %(is_binary)s,
+             %(psi)s,
+             %(ks_stat)s, %(ks_pvalue)s,
+             %(chi2_stat)s, %(chi2_pvalue)s,
+             %(wasserstein)s, %(wasserstein_norm)s,
+             %(js_divergence)s,
              %(mean_ref)s, %(mean_cur)s, %(mean_delta)s,
              %(std_ref)s, %(std_cur)s, %(std_delta)s,
              %(drift_flag)s, %(drift_reason)s)
         ON CONFLICT (monitoring_run_id, feature_name) DO NOTHING
     """
-    rows = [{"monitoring_run_id": monitoring_run_id, **m} for m in feature_metrics]
+    # Valeurs par défaut pour les colonnes optionnelles
+    # (compatibilité si appelé avec d'anciens dicts sans les champs v2)
+    defaults = {
+        "is_binary": False,
+        "chi2_stat": -1.0,
+        "chi2_pvalue": -1.0,
+        "wasserstein": None,
+        "wasserstein_norm": None,
+        "js_divergence": -1.0,
+    }
+    rows = [
+        {"monitoring_run_id": monitoring_run_id, **defaults, **m}
+        for m in feature_metrics
+    ]
 
     with get_connection() as conn:
         with conn.cursor() as cur:

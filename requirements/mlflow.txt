@@ -1,0 +1,15 @@
+# =============================================================================
+# requirements/mlflow.txt
+# Dépendances supplémentaires pour le conteneur MLflow server.
+#
+# L'image de base ghcr.io/mlflow/mlflow:v2.10.0 inclut déjà mlflow core.
+# On ajoute uniquement ce qui est nécessaire pour :
+#   - Backend store : Postgres  (--backend-store-uri postgresql://...)
+#   - Artifact store : MinIO    (--default-artifact-root s3://...)
+# =============================================================================
+
+# ── Backend store Postgres ────────────────────────────────────────────────────
+psycopg2-binary>=2.9.5
+
+# ── Artifact store MinIO via API S3 ──────────────────────────────────────────
+boto3>=1.34.0

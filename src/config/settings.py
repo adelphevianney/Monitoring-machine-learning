@@ -70,7 +70,7 @@ class MinIOConfig:
 
 @dataclass
 class PostgresConfig:
-    host: str = os.getenv("POSTGRES_HOST", "mlops-postgres")
+    host: str = os.getenv("POSTGRES_HOST", "localhost")
     port: int = int(os.getenv("POSTGRES_PORT", "5432"))
     database: str = os.getenv("POSTGRES_DB", "mlops")
     user: str = os.getenv("POSTGRES_USER", "mlops")
@@ -86,11 +86,19 @@ class PostgresConfig:
 
 @dataclass
 class MonitoringConfig:
-    psi_alert_threshold: float = 0.2
-    psi_critical_threshold: float = 0.25
+    # Seuils PSI
+    psi_alert_threshold: float = 0.01
+    psi_critical_threshold: float = 0.015
+    # Nombre de features simultanément en drift pour déclencher une alerte
     n_critical_features_for_alert: int = 2
-    consecutive_windows_for_retrain: int = 3
+    # Fenêtres consécutives en alerte critique avant ré-entraînement
+    consecutive_windows_for_retrain: int = 2
+    # Nombre de buckets pour PSI et Jensen-Shannon
     n_bins: int = 10
+    # Seuil Wasserstein normalisé (distance / std_ref)
+    wasserstein_threshold: float = 0.2
+    # Seuil Jensen-Shannon divergence (0=identique, 1=opposé)
+    js_threshold: float = 0.1
 
 
 # ── Instances globales ────────────────────────────────────────────────────────

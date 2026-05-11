@@ -1,13 +1,21 @@
 #!/bin/bash
 # =============================================================================
-# Crée plusieurs bases de données Postgres au démarrage du conteneur.
+# Crée plusieurs bases de données Postgres au démarrage du conteneur,
+# puis applique le schéma applicatif sur la base mlops.
 #
-# Format de la variable POSTGRES_MULTIPLE_DATABASES :
+# Format de POSTGRES_MULTIPLE_DATABASES :
 #   "db1:user1:password1,db2:user2:password2"
 #
-# Utilisé dans docker-compose.yml pour créer :
-#   - base "airflow"  avec user "airflow"  (pour Airflow)
-#   - base "mlops"    avec user "mlops"    (pour MLflow + tables applicatives)
+# Bases créées :
+#   - airflow : user airflow  (métadonnées internes Airflow)
+#   - mlops   : user mlops   (tables applicatives du projet)
+#
+# POURQUOI NE PAS UTILISER \connect DANS app_tables.sql ?
+# ────────────────────────────────────────────────────────
+# psql peut mal interpréter \connect dans certains contextes d'exécution
+# (docker-entrypoint-initdb.d), surtout avec des commentaires en français
+# qui contiennent des mots ressemblant à des options de connexion.
+# On contourne ça en passant -d mlops directement à psql ici.
 # =============================================================================
 
 set -e
@@ -28,7 +36,7 @@ EOSQL
     echo "  ✅ Base '$db' créée."
 }
 
-# Parser POSTGRES_MULTIPLE_DATABASES : "db1:user1:pw1,db2:user2:pw2"
+# ── Création des bases ────────────────────────────────────────────────────────
 if [ -n "$POSTGRES_MULTIPLE_DATABASES" ]; then
     echo "Initialisation des bases multiples..."
     for entry in $(echo "$POSTGRES_MULTIPLE_DATABASES" | tr ',' ' '); do
@@ -38,4 +46,20 @@ if [ -n "$POSTGRES_MULTIPLE_DATABASES" ]; then
         create_db_and_user "$db" "$user" "$password"
     done
     echo "Toutes les bases sont créées."
+fi
+
+# ── Application du schéma applicatif sur la base mlops ───────────────────────
+# On exécute app_tables.sql directement avec -d mlops pour éviter tout
+# problème de \connect. Le fichier est copié dans l'image par le Dockerfile.
+SQL_FILE="/docker-entrypoint-initdb.d/2_app_tables.sql"
+
+if [ -f "$SQL_FILE" ]; then
+    echo "Application du schéma applicatif sur la base 'mlops'..."
+    psql -v ON_ERROR_STOP=1 \
+         --username "$POSTGRES_USER" \
+         --dbname "mlops" \
+         --file "$SQL_FILE"
+    echo "  ✅ Schéma applicatif appliqué."
+else
+    echo "  ⚠️  $SQL_FILE introuvable — schéma non appliqué."
 fi

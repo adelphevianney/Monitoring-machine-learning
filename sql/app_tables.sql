@@ -1,18 +1,17 @@
 -- =============================================================================
--- TABLES APPLICATIVES — MLOps Drift Monitoring
+-- TABLES APPLICATIVES - MLOps Drift Monitoring
 -- Base cible : mlops
 --
--- Ce fichier est exécuté par docker-entrypoint-initdb.d/ APRÈS que
--- init-multiple-dbs.sh a créé la base "mlops" et son user.
--- Le SET search_path garantit que les tables atterrissent dans le bon schéma.
+-- CE FICHIER EST EXECUTE PAR init-multiple-dbs.sh via :
+--   psql --username postgres --dbname mlops --file 2_app_tables.sql
+--
+-- PAS DE \connect ICI - la base cible est passee en argument psql.
+-- Cela evite les problemes d interpretation de \connect dans
+-- docker-entrypoint-initdb.d sur certaines versions de psql/Alpine.
 -- =============================================================================
-
--- Connexion explicite à la base mlops
-\connect mlops
 
 SET search_path TO public;
 
--- Drop dans l'ordre inverse des FK pour éviter les erreurs de contrainte
 DROP TABLE IF EXISTS drift_feature_metrics CASCADE;
 DROP TABLE IF EXISTS drift_monitoring_runs CASCADE;
 DROP TABLE IF EXISTS reference_feature_stats CASCADE;
@@ -21,8 +20,6 @@ DROP TABLE IF EXISTS training_runs CASCADE;
 
 -- =============================================================================
 -- TABLE 1 : training_runs
--- Historique de tous les runs d'entraînement.
--- run_id = préfixe MinIO : runs/<run_id>/
 -- =============================================================================
 CREATE TABLE training_runs (
     id                 SERIAL PRIMARY KEY,
@@ -32,7 +29,6 @@ CREATE TABLE training_runs (
     dataset_uri        TEXT,
     dataset_version    VARCHAR(64),
     status             VARCHAR(32)  NOT NULL DEFAULT 'running',
-                       -- 'running' | 'success' | 'failed'
     n_rows             INTEGER,
     val_rmse           FLOAT,
     val_r2             FLOAT,
@@ -44,15 +40,9 @@ CREATE TABLE training_runs (
 CREATE INDEX idx_training_runs_model_status ON training_runs(model_name, status, run_date DESC);
 CREATE INDEX idx_training_runs_rundate      ON training_runs(run_date DESC);
 
-COMMENT ON TABLE training_runs IS
-    'Historique des runs d entraînement. Artefacts dans MinIO sous runs/<run_id>/.';
-COMMENT ON COLUMN training_runs.run_id IS
-    'Identifiant unique du run = préfixe MinIO runs/<run_id>/.';
-
 
 -- =============================================================================
 -- TABLE 2 : reference_feature_stats
--- Stats de distribution du dataset de référence, par feature et par run.
 -- =============================================================================
 CREATE TABLE reference_feature_stats (
     id           SERIAL      PRIMARY KEY,
@@ -74,13 +64,9 @@ CREATE TABLE reference_feature_stats (
 CREATE INDEX idx_ref_stats_runid   ON reference_feature_stats(run_id);
 CREATE INDEX idx_ref_stats_feature ON reference_feature_stats(feature_name);
 
-COMMENT ON TABLE reference_feature_stats IS
-    'Stats de référence par feature. Miroir du JSON MinIO sous runs/<run_id>/reference_stats/.';
-
 
 -- =============================================================================
 -- TABLE 3 : drift_monitoring_runs
--- Résultat global de chaque exécution du DAG drift_monitoring_pipeline.
 -- =============================================================================
 CREATE TABLE drift_monitoring_runs (
     id                        SERIAL      PRIMARY KEY,
@@ -94,7 +80,6 @@ CREATE TABLE drift_monitoring_runs (
     n_features_in_drift       INTEGER     NOT NULL DEFAULT 0,
     drift_detected            BOOLEAN     NOT NULL DEFAULT FALSE,
     alert_level               VARCHAR(32) NOT NULL DEFAULT 'none',
-                              -- 'none' | 'warning' | 'critical'
     consecutive_drift_windows INTEGER     NOT NULL DEFAULT 0,
     retrain_triggered         BOOLEAN     NOT NULL DEFAULT FALSE,
     created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -104,22 +89,24 @@ CREATE INDEX idx_monitoring_runs_ref_run    ON drift_monitoring_runs(ref_run_id,
 CREATE INDEX idx_monitoring_runs_alertlevel ON drift_monitoring_runs(alert_level, created_at DESC);
 CREATE INDEX idx_monitoring_runs_drift      ON drift_monitoring_runs(drift_detected, created_at DESC);
 
-COMMENT ON COLUMN drift_monitoring_runs.ref_run_id IS
-    'run_id du training run utilisé comme référence pour ce check de drift.';
-
 
 -- =============================================================================
 -- TABLE 4 : drift_feature_metrics
--- Détail du drift par feature pour chaque monitoring_run.
 -- =============================================================================
 CREATE TABLE drift_feature_metrics (
     id                SERIAL      PRIMARY KEY,
     monitoring_run_id VARCHAR(64) NOT NULL
                       REFERENCES drift_monitoring_runs(monitoring_run_id) ON DELETE CASCADE,
     feature_name      VARCHAR(128) NOT NULL,
+    is_binary         BOOLEAN     NOT NULL DEFAULT FALSE,
     psi               FLOAT,
     ks_stat           FLOAT,
     ks_pvalue         FLOAT,
+    chi2_stat         FLOAT,
+    chi2_pvalue       FLOAT,
+    wasserstein       FLOAT,
+    wasserstein_norm  FLOAT,
+    js_divergence     FLOAT,
     mean_ref          FLOAT,
     mean_cur          FLOAT,
     mean_delta        FLOAT,
@@ -139,7 +126,26 @@ CREATE INDEX idx_drift_metrics_flag    ON drift_feature_metrics(drift_flag, feat
 
 
 -- =============================================================================
--- VUE : dernier état du monitoring
+-- PERMISSIONS
+-- =============================================================================
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    training_runs,
+    reference_feature_stats,
+    drift_monitoring_runs,
+    drift_feature_metrics
+TO mlops;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mlops;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mlops;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO mlops;
+
+
+-- =============================================================================
+-- VUES
 -- =============================================================================
 CREATE OR REPLACE VIEW v_latest_drift_status AS
 SELECT
@@ -163,10 +169,9 @@ GROUP BY mr.monitoring_run_id, mr.created_at, mr.alert_level,
          mr.drift_score_global, mr.n_features_in_drift,
          mr.consecutive_drift_windows, mr.retrain_triggered;
 
+GRANT SELECT ON v_latest_drift_status TO mlops;
 
--- =============================================================================
--- VUE : historique des 30 dernières alertes
--- =============================================================================
+
 CREATE OR REPLACE VIEW v_alert_history AS
 SELECT
     monitoring_run_id,
@@ -180,38 +185,4 @@ FROM drift_monitoring_runs
 ORDER BY created_at DESC
 LIMIT 30;
 
--- =============================================================================
--- PERMISSIONS — accorder tous les droits à l'utilisateur applicatif mlops
---
--- POURQUOI : ce fichier est exécuté par le superuser postgres dans
--- docker-entrypoint-initdb.d/. Les tables sont donc owned par postgres.
--- Sans ces GRANT, l'utilisateur mlops peut se connecter à la base
--- mais ne peut ni lire ni écrire dans les tables.
---
--- ALTER DEFAULT PRIVILEGES couvre les objets créés APRÈS ce script
--- (ex: séquences créées lors des premiers INSERT sur les colonnes SERIAL).
--- =============================================================================
-
--- Tables
-GRANT SELECT, INSERT, UPDATE, DELETE ON
-    training_runs,
-    reference_feature_stats,
-    drift_monitoring_runs,
-    drift_feature_metrics
-TO mlops;
-
--- Vues (lecture seule)
-GRANT SELECT ON
-    v_latest_drift_status,
-    v_alert_history
-TO mlops;
-
--- Séquences SERIAL (nécessaire pour les INSERT avec id auto-incrémenté)
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mlops;
-
--- Droits par défaut pour les futurs objets créés par postgres dans cette base
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mlops;
-
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT USAGE, SELECT ON SEQUENCES TO mlops;
+GRANT SELECT ON v_alert_history TO mlops;

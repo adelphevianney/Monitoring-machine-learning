@@ -13,28 +13,40 @@ MÉTRIQUES IMPLÉMENTÉES
        PSI > 0.20  → drift significatif, alerter
 
 2. Test KS (Kolmogorov-Smirnov)
-   - Mesure la distance maximale entre deux CDF (fonctions de répartition cumulée)
-   - Produit une stat et une p-value
-   - p-value < 0.05 → les deux distributions sont significativement différentes
+   - Mesure la distance maximale entre deux CDF
+   - p-value < 0.05 → distributions statistiquement différentes
+   - Idéal : variables continues (x1, x2, x3)
 
-3. Delta mean / std / mean_delta_pct
+3. Wasserstein Distance (Earth Mover's Distance)
+   - Mesure le "coût de transport" pour transformer une distribution en l'autre
+   - Avantages vs KS : sensible à l'amplitude du shift (pas juste sa présence),
+     très robuste sur les petits échantillons (<500 lignes)
+   - Normalisée par l'écart-type de référence pour être comparable entre features
+   - Seuil : wasserstein_norm > 0.2 → drift détecté
+
+4. Test Chi² (Chi-carré)
+   - Test statistique sur variables catégorielles / binaires
+   - Utilisé automatiquement pour x4 (Bernoulli) si la feature est binaire (0/1)
+   - p-value < 0.05 → les fréquences ont changé significativement
+   - Complète KS qui suppose une variable continue
+
+5. Jensen-Shannon Divergence
+   - Symétrique, bornée entre 0 et 1
+   - Mesure la divergence entre deux distributions discrétisées
+   - Seuil : js_divergence > 0.1 → drift modéré
+
+6. Delta mean / std / mean_delta_pct
    - Comparaison directe des statistiques descriptives
-   - Utile pour comprendre dans quel sens la distribution a dérivé
 
-4. Stats courantes (current_mean, current_std, quartiles)
-   - Exportées telles quelles pour le stockage Postgres et le reporting
-
-POURQUOI CES DEUX MÉTRIQUES ENSEMBLE ?
-──────────────────────────────────────
-Le PSI est bon pour détecter des shifts globaux (toute la distribution se déplace).
-Le KS est bon pour détecter des changements locaux (une queue de distribution qui grossit).
-Ensemble, ils couvrent la plupart des patterns de drift réels.
+SÉLECTION AUTOMATIQUE DES TESTS
+────────────────────────────────
+  Variable binaire (0/1 uniquement) → PSI + Chi² + Wasserstein
+  Variable continue                 → PSI + KS + Wasserstein + Jensen-Shannon
 
 CONTRAT AVEC alerting.py
 ────────────────────────
 compute_drift_report() retourne Dict[str, FeatureDriftResult].
-alerting.py consomme ces objets directement (plus de conversion Dict intermédiaire).
-Les deux modules partagent la même structure FeatureDriftResult.
+alerting.py consomme ces objets directement.
 """
 
 import logging
@@ -61,29 +73,61 @@ class FeatureDriftResult:
     - aux règles de décision d'alerting.py
     - au stockage Postgres (drift_feature_metrics)
     - au reporting / format_drift_report()
+    - à l'indexation Elasticsearch
 
-    Attributs :
+    Attributs de base :
         feature_name    : nom de la colonne
+        is_binary       : True si la feature est binaire (0/1) → guide le choix des tests
+
+    Métriques PSI :
         psi             : Population Stability Index
+
+    Métriques KS (variables continues uniquement) :
         ks_stat         : statistique du test KS
-        ks_pvalue       : p-value du test KS
-        mean_ref        : moyenne sur la distribution de référence
-        mean_cur        : moyenne sur la distribution courante
-        mean_delta      : différence absolue des moyennes
-        mean_delta_pct  : différence relative des moyennes en %
-        std_ref         : écart-type de référence
-        std_cur         : écart-type courant
-        std_delta       : différence absolue des écarts-types
-        current_q25     : 1er quartile de la distribution courante
-        current_median  : médiane de la distribution courante
-        current_q75     : 3ème quartile de la distribution courante
-        drift_flag      : True si la feature est considérée en drift
-        drift_reason    : explication textuelle du déclenchement
+        ks_pvalue       : p-value du test KS (-1.0 si non applicable)
+
+    Métriques Chi² (variables binaires uniquement) :
+        chi2_stat       : statistique du test Chi² (-1.0 si non applicable)
+        chi2_pvalue     : p-value du test Chi² (-1.0 si non applicable)
+
+    Wasserstein (toutes variables) :
+        wasserstein     : distance de Wasserstein brute
+        wasserstein_norm: distance normalisée par std_ref (comparable entre features)
+
+    Jensen-Shannon (variables continues uniquement) :
+        js_divergence   : divergence Jensen-Shannon (0=identique, 1=opposé)
+
+    Stats descriptives :
+        mean_ref / mean_cur / mean_delta / mean_delta_pct
+        std_ref / std_cur / std_delta
+        current_q25 / current_median / current_q75
+
+    Verdict :
+        drift_flag      : True si au moins un test détecte un drift
+        drift_reason    : explication textuelle du/des déclenchements
     """
     feature_name: str
+    is_binary: bool
+
+    # PSI
     psi: float
+
+    # KS (continues) — -1.0 si non calculé
     ks_stat: float
     ks_pvalue: float
+
+    # Chi² (binaires) — -1.0 si non calculé
+    chi2_stat: float
+    chi2_pvalue: float
+
+    # Wasserstein (toutes)
+    wasserstein: float
+    wasserstein_norm: float
+
+    # Jensen-Shannon (continues)
+    js_divergence: float
+
+    # Stats descriptives
     mean_ref: float
     mean_cur: float
     mean_delta: float
@@ -94,8 +138,17 @@ class FeatureDriftResult:
     current_q25: float
     current_median: float
     current_q75: float
+
+    # Verdict
     drift_flag: bool
     drift_reason: str = ""
+
+    # Histogrammes de distribution (pour visualisation Kibana/Vega)
+    # Bins communs ref + cur → superposition directe dans Vega
+    # Listes Python (sérialisables JSON/ES/XCom)
+    distribution_ref: List[float] = field(default_factory=list)
+    distribution_cur: List[float] = field(default_factory=list)
+    bin_edges: List[float] = field(default_factory=list)
 
 
 # ── Calcul PSI ────────────────────────────────────────────────────────────────
@@ -105,7 +158,7 @@ def compute_psi(
     current: np.ndarray,
     n_bins: int = 10,
     epsilon: float = 1e-6,
-) -> Tuple[float, np.ndarray, np.ndarray]:
+) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calcule le PSI entre une distribution de référence et une distribution courante.
 
@@ -121,7 +174,9 @@ def compute_psi(
         epsilon   : petite valeur pour éviter log(0)
 
     Returns:
-        (psi_total, proportions_ref, proportions_cur)
+        (psi_total, proportions_ref, proportions_cur, bucket_edges)
+        Les proportions et bucket_edges sont utilisés pour construire
+        les histogrammes de distribution stockés dans ES et le snapshot JSON.
     """
     quantile_points = np.linspace(0, 100, n_bins + 1)
     bucket_edges = np.percentile(reference, quantile_points)
@@ -139,7 +194,45 @@ def compute_psi(
     psi_per_bucket = (ref_props - cur_props) * np.log(ref_props / cur_props)
     psi_total = float(psi_per_bucket.sum())
 
-    return psi_total, ref_props, cur_props
+    return psi_total, ref_props, cur_props, bucket_edges
+
+
+def _build_histogram(
+    reference: np.ndarray,
+    current: np.ndarray,
+    n_bins: int = 10,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Construit les histogrammes de distribution sur des bins communs.
+
+    Utilise les mêmes bins pour ref et cur afin que Kibana/Vega puisse
+    les superposer directement sur le même axe X.
+
+    Les bins sont calculés sur l'union des deux distributions pour
+    couvrir toute la plage de valeurs observées.
+
+    Returns:
+        (distribution_ref, distribution_cur, bin_edges)
+        Toutes les valeurs sont des listes Python (sérialisables JSON).
+        distribution_ref[i] = proportion des valeurs de ref dans le bin i
+        distribution_cur[i] = proportion des valeurs de cur dans le bin i
+        bin_edges a len(distribution_ref) + 1 éléments (bornes des bins)
+    """
+    combined_min = float(min(reference.min(), current.min()))
+    combined_max = float(max(reference.max(), current.max()))
+
+    # Légère extension des bornes pour inclure les valeurs exactes min/max
+    margin = (combined_max - combined_min) * 0.01
+    edges = np.linspace(combined_min - margin, combined_max + margin, n_bins + 1)
+
+    ref_counts, _ = np.histogram(reference, bins=edges)
+    cur_counts, _ = np.histogram(current, bins=edges)
+
+    ref_props = (ref_counts / len(reference)).tolist()
+    cur_props = (cur_counts / len(current)).tolist()
+    bin_edges = [round(float(e), 6) for e in edges]
+
+    return ref_props, cur_props, bin_edges
 
 
 # ── Calcul KS ─────────────────────────────────────────────────────────────────
@@ -158,7 +251,111 @@ def compute_ks(
     return float(result.statistic), float(result.pvalue)
 
 
+# ── Calcul Wasserstein ────────────────────────────────────────────────────────
+
+def compute_wasserstein(
+    reference: np.ndarray,
+    current: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    Calcule la distance de Wasserstein (Earth Mover's Distance) entre deux distributions.
+
+    La distance brute est normalisée par l'écart-type de la référence pour
+    la rendre comparable entre features d'échelles différentes.
+
+    Returns:
+        (wasserstein_brut, wasserstein_normalisé)
+    """
+    w = float(stats.wasserstein_distance(reference, current))
+    std_ref = float(np.std(reference))
+    w_norm = w / std_ref if std_ref > 0 else 0.0
+    return w, w_norm
+
+
+# ── Calcul Chi² ───────────────────────────────────────────────────────────────
+
+def compute_chi2(
+    reference: np.ndarray,
+    current: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    Applique le test Chi² d'homogénéité entre deux distributions de fréquences.
+
+    Utilisé pour les variables binaires (0/1) ou catégorielles où KS
+    n'est pas adapté (distributions discrètes).
+
+    Construit une table de contingence 2×2 :
+        ref_0  ref_1
+        cur_0  cur_1
+
+    Returns:
+        (chi2_stat, p_value)
+        (-1.0, -1.0) si le test n'est pas applicable (une catégorie absente)
+    """
+    ref_0 = int(np.sum(reference == 0))
+    ref_1 = int(np.sum(reference == 1))
+    cur_0 = int(np.sum(current == 0))
+    cur_1 = int(np.sum(current == 1))
+
+    # Le test nécessite que chaque cellule ait au moins 5 observations
+    contingency = np.array([[ref_0, ref_1], [cur_0, cur_1]])
+    if np.any(contingency < 5):
+        logger.debug("Chi² non applicable : effectifs insuffisants %s", contingency.tolist())
+        return -1.0, -1.0
+
+    chi2, p, _, _ = stats.chi2_contingency(contingency)
+    return float(chi2), float(p)
+
+
+# ── Calcul Jensen-Shannon ─────────────────────────────────────────────────────
+
+def compute_js_divergence(
+    reference: np.ndarray,
+    current: np.ndarray,
+    n_bins: int = 50,
+    epsilon: float = 1e-10,
+) -> float:
+    """
+    Calcule la divergence Jensen-Shannon entre deux distributions.
+
+    JS est symétrique (contrairement à KL) et bornée entre 0 et 1.
+    Les distributions sont discrétisées sur les mêmes bins pour être comparables.
+
+    JS = 0   → distributions identiques
+    JS = 1   → distributions totalement différentes (log base 2)
+
+    Seuil pratique : JS > 0.1 → drift modéré, JS > 0.2 → drift significatif
+
+    Returns:
+        js_divergence (float, entre 0 et 1)
+    """
+    # Discrétisation sur les mêmes bins (couvrant les deux distributions)
+    combined_min = min(reference.min(), current.min())
+    combined_max = max(reference.max(), current.max())
+    bins = np.linspace(combined_min, combined_max, n_bins + 1)
+
+    ref_hist, _ = np.histogram(reference, bins=bins, density=False)
+    cur_hist, _ = np.histogram(current, bins=bins, density=False)
+
+    # Conversion en probabilités avec epsilon pour éviter log(0)
+    p = (ref_hist + epsilon) / (ref_hist + epsilon).sum()
+    q = (cur_hist + epsilon) / (cur_hist + epsilon).sum()
+
+    # Mixture M = (P + Q) / 2
+    m = (p + q) / 2
+
+    # JS = (KL(P||M) + KL(Q||M)) / 2
+    js = 0.5 * np.sum(p * np.log2(p / m)) + 0.5 * np.sum(q * np.log2(q / m))
+    return float(np.clip(js, 0.0, 1.0))
+
+
 # ── Calcul par feature ────────────────────────────────────────────────────────
+
+def _is_binary(arr: np.ndarray) -> bool:
+    """Détecte si un tableau ne contient que des valeurs 0 et 1."""
+    unique = np.unique(arr)
+    return set(unique.tolist()).issubset({0.0, 1.0, 0, 1})
+
 
 def compute_feature_drift(
     feature_name: str,
@@ -169,61 +366,100 @@ def compute_feature_drift(
     """
     Calcule toutes les métriques de drift pour une feature donnée.
 
-    La logique de drift_flag :
-      Un flag est levé si :
-        - PSI > psi_alert_threshold (configurable, 0.10 par défaut)
-        OU
-        - KS p-value < 0.05 (rejet de H0 avec confiance 95%)
+    Sélection automatique des tests selon le type de variable :
+      - Binaire (0/1) : PSI + Chi² + Wasserstein
+      - Continue      : PSI + KS + Wasserstein + Jensen-Shannon
+
+    Logique du drift_flag :
+      Levé si AU MOINS UN des critères suivants est vrai :
+        - PSI > psi_alert_threshold
+        - KS p-value < 0.05 (continues)
+        - Chi² p-value < 0.05 (binaires)
+        - Wasserstein normalisé > wasserstein_threshold (0.2 par défaut)
+        - JS divergence > js_threshold (0.1 par défaut)
 
     Args:
-        feature_name : nom de la feature (pour les logs)
-        reference    : valeurs de la distribution de référence (numpy array)
-        current      : valeurs de la distribution courante (numpy array)
+        feature_name : nom de la feature
+        reference    : valeurs de la distribution de référence
+        current      : valeurs de la distribution courante
         cfg          : configuration des seuils
 
     Returns:
-        FeatureDriftResult avec toutes les métriques calculées
+        FeatureDriftResult complet
     """
-    psi, _, _ = compute_psi(reference, current, n_bins=cfg.n_bins)
-    ks_stat, ks_pvalue = compute_ks(reference, current)
+    binary = _is_binary(reference)
 
+    # ── PSI (toutes variables) ────────────────────────────────────────────────
+    psi, _, _, _ = compute_psi(reference, current, n_bins=cfg.n_bins)
+
+    # ── Histogrammes sur bins communs (pour Kibana/Vega) ──────────────────────
+    distribution_ref, distribution_cur, bin_edges = _build_histogram(
+        reference, current, n_bins=cfg.n_bins
+    )
+
+    # ── Wasserstein (toutes variables) ────────────────────────────────────────
+    wasserstein, wasserstein_norm = compute_wasserstein(reference, current)
+
+    # ── Tests spécifiques selon le type ──────────────────────────────────────
+    if binary:
+        ks_stat, ks_pvalue = -1.0, -1.0
+        chi2_stat, chi2_pvalue = compute_chi2(reference, current)
+        js_divergence = -1.0
+    else:
+        ks_stat, ks_pvalue = compute_ks(reference, current)
+        chi2_stat, chi2_pvalue = -1.0, -1.0
+        js_divergence = compute_js_divergence(reference, current)
+
+    # ── Stats descriptives ────────────────────────────────────────────────────
     mean_ref = float(np.mean(reference))
     mean_cur = float(np.mean(current))
     std_ref = float(np.std(reference))
     std_cur = float(np.std(current))
-
     mean_delta = abs(mean_cur - mean_ref)
-    mean_delta_pct = (
-        float((mean_cur - mean_ref) / mean_ref * 100) if mean_ref != 0 else 0.0
-    )
-
+    mean_delta_pct = float((mean_cur - mean_ref) / mean_ref * 100) if mean_ref != 0 else 0.0
     current_q25 = float(np.percentile(current, 25))
     current_median = float(np.median(current))
     current_q75 = float(np.percentile(current, 75))
 
-    drift_flag = False
+    # ── Verdict ───────────────────────────────────────────────────────────────
     reasons = []
 
     if psi > cfg.psi_alert_threshold:
-        drift_flag = True
-        reasons.append(f"PSI={psi:.3f} > seuil {cfg.psi_alert_threshold}")
+        reasons.append(f"PSI={psi:.3f} > {cfg.psi_alert_threshold}")
 
-    if ks_pvalue < 0.05:
-        drift_flag = True
+    if not binary and ks_pvalue < 0.05:
         reasons.append(f"KS p-value={ks_pvalue:.4f} < 0.05")
 
+    if binary and chi2_pvalue != -1.0 and chi2_pvalue < 0.05:
+        reasons.append(f"Chi²={chi2_stat:.3f} p-value={chi2_pvalue:.4f} < 0.05")
+
+    if wasserstein_norm > cfg.wasserstein_threshold:
+        reasons.append(f"Wasserstein normalisé={wasserstein_norm:.3f} > {cfg.wasserstein_threshold}")
+
+    if not binary and js_divergence != -1.0 and js_divergence > cfg.js_threshold:
+        reasons.append(f"JS divergence={js_divergence:.3f} > {cfg.js_threshold}")
+
+    drift_flag = len(reasons) > 0
     drift_reason = " | ".join(reasons) if reasons else "stable"
 
+    test_used = "Chi²+Wasserstein" if binary else "KS+Wasserstein+JS"
     logger.debug(
-        "Feature '%s' : PSI=%.4f | KS=%.4f (p=%.4f) | drift=%s",
-        feature_name, psi, ks_stat, ks_pvalue, drift_flag,
+        "Feature '%s' [%s] : PSI=%.4f | W_norm=%.4f | drift=%s",
+        feature_name, "binaire" if binary else "continue",
+        psi, wasserstein_norm, drift_flag,
     )
 
     return FeatureDriftResult(
         feature_name=feature_name,
+        is_binary=binary,
         psi=psi,
         ks_stat=ks_stat,
         ks_pvalue=ks_pvalue,
+        chi2_stat=chi2_stat,
+        chi2_pvalue=chi2_pvalue,
+        wasserstein=wasserstein,
+        wasserstein_norm=wasserstein_norm,
+        js_divergence=js_divergence,
         mean_ref=mean_ref,
         mean_cur=mean_cur,
         mean_delta=mean_delta,
@@ -236,6 +472,9 @@ def compute_feature_drift(
         current_q75=current_q75,
         drift_flag=drift_flag,
         drift_reason=drift_reason,
+        distribution_ref=distribution_ref,
+        distribution_cur=distribution_cur,
+        bin_edges=bin_edges,
     )
 
 
@@ -336,17 +575,25 @@ def feature_results_to_rows(
 ) -> List[Dict]:
     """
     Convertit les résultats par feature en liste de dicts
-    prêts pour postgres_client.insert_drift_feature_metrics().
+    prêts pour postgres_client.insert_drift_feature_metrics(),
+    l'indexation ES et le snapshot JSON MinIO.
 
-    Centralise la sérialisation ici plutôt que dans le DAG.
+    Inclut distribution_ref, distribution_cur, bin_edges
+    pour la visualisation Kibana/Vega.
     """
     rows = []
     for fname, r in feature_results.items():
         rows.append({
             "feature_name": fname,
+            "is_binary": r.is_binary,
             "psi": r.psi,
             "ks_stat": r.ks_stat,
             "ks_pvalue": r.ks_pvalue,
+            "chi2_stat": r.chi2_stat,
+            "chi2_pvalue": r.chi2_pvalue,
+            "wasserstein": r.wasserstein,
+            "wasserstein_norm": r.wasserstein_norm,
+            "js_divergence": r.js_divergence,
             "mean_ref": r.mean_ref,
             "mean_cur": r.mean_cur,
             "mean_delta": r.mean_delta,
@@ -355,6 +602,10 @@ def feature_results_to_rows(
             "std_delta": r.std_delta,
             "drift_flag": r.drift_flag,
             "drift_reason": r.drift_reason,
+            # Histogrammes — bins communs ref/cur pour Kibana/Vega
+            "distribution_ref": r.distribution_ref,
+            "distribution_cur": r.distribution_cur,
+            "bin_edges": r.bin_edges,
         })
     return rows
 
@@ -368,29 +619,39 @@ def format_drift_report(
 ) -> str:
     """Formate un rapport texte lisible pour les logs ou alertes."""
     lines = [
-        "=" * 60,
+        "=" * 75,
         f"  RAPPORT DE DRIFT",
         f"  Score global (PSI moyen) : {global_score:.4f}",
         f"  Niveau d'alerte          : {alert_level.upper()}",
-        "=" * 60,
-        f"{'Feature':<12} {'PSI':>8} {'KS stat':>10} {'KS p-val':>10} {'Δmean':>10} {'Drift':>8}",
-        "-" * 60,
+        "=" * 75,
+        f"{'Feature':<8} {'Type':<8} {'PSI':>7} {'KS/χ²p':>9} {'W_norm':>8} {'JS':>7} {'Drift':>7}",
+        "-" * 75,
     ]
 
     for feat, r in sorted(feature_results.items()):
         drift_icon = "⚠ OUI" if r.drift_flag else "  non"
+        type_label = "binaire" if r.is_binary else "continu"
+
+        # KS p-value pour continues, Chi² p-value pour binaires
+        if r.is_binary:
+            test_p = f"{r.chi2_pvalue:.4f}" if r.chi2_pvalue != -1.0 else "  N/A"
+        else:
+            test_p = f"{r.ks_pvalue:.4f}" if r.ks_pvalue != -1.0 else "  N/A"
+
+        js_str = f"{r.js_divergence:.4f}" if r.js_divergence != -1.0 else "  N/A"
+
         lines.append(
-            f"{feat:<12} {r.psi:>8.4f} {r.ks_stat:>10.4f} {r.ks_pvalue:>10.4f}"
-            f" {r.mean_delta:>10.4f} {drift_icon:>8}"
+            f"{feat:<8} {type_label:<8} {r.psi:>7.4f} {test_p:>9} "
+            f"{r.wasserstein_norm:>8.4f} {js_str:>7} {drift_icon:>7}"
         )
 
-    lines.append("=" * 60)
+    lines.append("=" * 75)
 
     drifted = [(n, r) for n, r in feature_results.items() if r.drift_flag]
     if drifted:
         lines.append("\nDÉTAIL DES FEATURES EN DRIFT :")
         for name, r in drifted:
-            lines.append(f"  {name} :")
+            lines.append(f"  {name} ({'binaire' if r.is_binary else 'continue'}) :")
             lines.append(
                 f"    mean  : {r.mean_ref:.4f} (ref) → {r.mean_cur:.4f} (cur)"
                 f"  Δ={r.mean_delta:.4f} ({r.mean_delta_pct:+.1f}%)"
